@@ -35,3 +35,6 @@ pub use response::{ApiDocument, PageMeta};
 pub use router::{DynamicRouter, RouteRegistration};
 pub use selection::{FieldSelection, SelectionTree, selected_fields};
 pub use sideload::{ADDITIONAL_PRIMARY_RESOURCE_PREFIX, SideloadingProcessor};
+
+#[cfg(feature = "application")]
+pub mod application;

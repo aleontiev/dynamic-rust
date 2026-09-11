@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>Sign in to @@APP@@</title>
+@@ICON@@
+<script nonce="@@NONCE@@">document.documentElement.dataset.brandingPending = '';</script>
+<script nonce="@@NONCE@@" src="/branding.js"></script>
+<style nonce="@@NONCE@@">
+[data-branding-pending] body{visibility:hidden}:root{--primary:@@PRIMARY@@;--accent:@@ACCENT@@;color:#182728;font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#fff}.screen{display:grid;grid-template-columns:1fr 1fr;min-height:100vh}.visual{background:var(--primary);color:#fff;position:relative;overflow:hidden;display:flex;align-items:center;padding:12%}.visual:before,.visual:after{content:"";position:absolute;width:560px;height:560px;border:1px solid var(--accent);border-radius:50%;right:-220px;top:-150px;opacity:.4}.visual:after{width:720px;height:720px;right:-300px;top:-230px;opacity:.2}.welcome{position:relative;max-width:410px}.eyebrow{color:#000;font-size:13px;letter-spacing:.16em;text-transform:uppercase}.welcome h1{font-size:clamp(40px,4.2vw,66px);line-height:1.08;font-weight:500;letter-spacing:-.045em;margin:25px 0}.welcome p{max-width:320px;color:#ffffffb8}.panel{display:flex;flex-direction:column;padding:44px 9%;min-width:0}.brand{font-size:21px;font-weight:650;display:flex;align-items:center;gap:12px;min-height:50px}.brand img{max-width:190px;max-height:55px;object-fit:contain}.form-wrap{width:100%;max-width:400px;margin:auto;padding:55px 0}h2{font-size:27px;font-weight:500;line-height:1.3;margin:0 0 12px;letter-spacing:-.025em}.intro{color:#647172;font-size:15px;margin:0 0 28px}label{display:block;font-size:13px;font-weight:600;margin-bottom:7px}input{width:100%;border:1px solid #c7cecd;border-radius:7px;padding:14px;font:inherit;outline:none}input:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--accent)}button{font:inherit;border:0;border-radius:7px;padding:13px 18px;cursor:pointer}.submit{background:var(--primary);color:#fff;width:100%;font-weight:600;margin-top:20px}.submit:disabled{opacity:.55;cursor:wait}.secondary{background:transparent;color:var(--primary);padding-left:0;margin-top:12px}.note{font-size:13px;color:#73807f;margin-top:23px}.notice{font-size:14px;padding:13px 15px;background:#f0f6f3;border-radius:7px;margin:20px 0}.notice.error{background:#fff1ee;color:#913c2b}footer{font-size:12px;color:#7b8684}[hidden]{display:none!important}@media(max-width:760px){.screen{display:block}.visual{display:none}.panel{min-height:100vh;padding:30px 26px}.brand{justify-content:center}.form-wrap{padding:55px 0}footer{text-align:center}}
+.google{display:block;text-align:center;border:1px solid #c7cecd;border-radius:7px;padding:13px 18px;margin-bottom:22px;color:#182728;text-decoration:none;font-weight:600}
+</style>
+</head>
+<body><main class="screen">
+<aside class="visual" aria-hidden="true"><div class="welcome"><div class="eyebrow company-name">@@COMPANY@@</div><h1>A simpler way<br>to sign in.</h1><p>Welcome to @@APP@@.<br>Your workspace is one email away.</p></div></aside>
+<section class="panel"><div class="brand">@@LOGO@@<span class="company-name" id="brand-name">@@COMPANY@@</span></div>
+<div class="form-wrap"><h2 id="heading">Sign in to @@APP@@</h2><p id="intro" class="intro">Enter your email and we'll send you a secure sign-in link.</p>
+@@GOOGLE@@
+<form id="email-form"><label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="email" placeholder="you@company.com" maxlength="254" required><button class="submit" id="send" type="submit">Send sign-in link</button></form>
+<form id="confirm-form" hidden><button class="submit" id="confirm" type="submit">Confirm sign in</button></form>
+<div id="notice" class="notice" role="status" aria-live="polite" hidden></div><button id="again" class="secondary" type="button" hidden>Request a new link</button>
+<p class="note">No password needed. Sign-in links work once and expire after 15 minutes.</p></div>
+<footer>© <span class="company-name">@@COMPANY@@</span></footer></section></main>
+<script nonce="@@NONCE@@">
+@@PREVIEW_SCRIPT@@
+(() => {
+  const form=document.getElementById('email-form'),confirmForm=document.getElementById('confirm-form'),notice=document.getElementById('notice'),again=document.getElementById('again');
+  const googleError=new URLSearchParams(location.search).get('google_error');
+  let token=new URLSearchParams(location.hash.slice(1)).get('token');
+  if(location.hash||googleError) history.replaceState(null,'',location.pathname);
+  function message(text,error=false){notice.textContent=text;notice.classList.toggle('error',error);notice.hidden=false;}
+  const embedded=window.top!==window;
+  if(embedded)document.querySelector('.google')?.addEventListener('click',event=>{event.preventDefault();if(!window.dreamPreviewAuthenticate('google'))message('Allow the sign-in window to open, then try again.',true);});
+  if(googleError){const messages={unavailable:'Google sign-in is temporarily unavailable. Please use an email link or try again.',expired:'This Google sign-in has expired or was already used. Please try again.',cancelled:'Google sign-in was cancelled. You can try again or use an email link.',email_link:'Use an email sign-in link to access the existing account for this email address.'};message(messages[googleError]||messages.unavailable,true);}
+  function reset(){token=null;confirmForm.hidden=true;form.hidden=false;again.hidden=true;notice.hidden=true;document.getElementById('heading').textContent=document.title;document.getElementById('intro').textContent="Enter your email and we'll send you a secure sign-in link.";document.getElementById('email').focus();}
+  if(token){form.hidden=true;confirmForm.hidden=false;document.getElementById('intro').textContent='Select Confirm sign in to use this email link. Opening this page does not sign you in.';again.hidden=false;}
+  async function post(path,body){const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'});let result={};try{result=await response.json();}catch{}return {response,result};}
+  form.addEventListener('submit',async(event)=>{event.preventDefault();if(embedded){if(!window.dreamPreviewAuthenticate('email',document.getElementById('email').value))message('Allow the sign-in window to open, then try again.',true);return;}const button=document.getElementById('send');button.disabled=true;notice.hidden=true;try{const {response,result}=await post('/api/auth/magic-link',{email:document.getElementById('email').value});if(response.ok){form.hidden=true;again.hidden=false;message('Check your inbox. Follow the sign-in link in your email to continue.');}else{message(result.detail||'We could not send a link. Please try again.',true);}}catch{message('Could not connect. Please try again.',true);}finally{button.disabled=false;}});
+  confirmForm.addEventListener('submit',async(event)=>{event.preventDefault();const button=document.getElementById('confirm');button.disabled=true;try{const {response}=await post('/api/auth/verify',{token});if(response.ok){token=null;location.assign('/');}else if(response.status===401){token=null;confirmForm.hidden=true;again.hidden=false;message('This link has expired or has already been used. Request a new link to sign in.',true);}else{message('Could not sign in. Please try again.',true);}}catch{message('Could not connect. Please try again.',true);}finally{button.disabled=false;}});
+  again.addEventListener('click',reset);
+  (() => {
+    const branding=window.__DREAM_BRANDING__;
+    try {
+    if(!branding||typeof branding!=='object')return;
+    if(typeof branding.company_name==='string'&&branding.company_name.trim())document.querySelectorAll('.company-name').forEach(node=>node.textContent=branding.company_name);
+    for(const [key,property] of [['primary_color','--primary'],['accent_color','--accent']])if(/^#[0-9a-f]{6}$/i.test(branding[key]||''))document.documentElement.style.setProperty(property,branding[key]);
+    for(const [key,id] of [['logo_url','brand-logo'],['icon_url','brand-favicon']]){
+      const src=branding[key.replace('_url','_light_url')]||branding[key]||'';let safe=false;
+      try{const parsed=new URL(src);safe=parsed.protocol==='https:'&&!parsed.username&&!parsed.password;}catch{}
+      if(/^data:image\/(png|jpeg|webp|svg\+xml);base64,[a-z0-9+/=]+$/i.test(src)&&src.length<=1400000)safe=true;
+      const node=document.getElementById(id),attribute=key==='icon_url'?'href':'src';if(safe){node.setAttribute(attribute,src);node.hidden=false;if(key==='logo_url')node.alt=branding.company_name||'Company logo';}else{node.removeAttribute(attribute);if(key==='logo_url')node.hidden=true;}
+    }
+    } finally { delete document.documentElement.dataset.brandingPending; }
+  })();
+})();
+</script></body></html>

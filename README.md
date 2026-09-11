@@ -20,3 +20,9 @@ Run `cargo test --all-features` and `cargo clippy --all-targets --all-features -
 See [COMPATIBILITY.md](COMPATIBILITY.md) for implemented surfaces and limitations.
 
 MIT license. Author: alonetiev@gmail.com.
+
+## PostgreSQL application runtime
+
+Enable the optional `application` feature for registered business models, CRUD,
+transactional hooks/actions, durable tasks and shared app authentication. See
+[the application guide](APPLICATION.md) and its executable integration tests.
