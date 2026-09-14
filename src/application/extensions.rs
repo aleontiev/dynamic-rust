@@ -296,6 +296,10 @@ impl Registry {
     pub async fn migrate(&self, pool: &PgPool) -> Result<(), ApiError> {
         let mut tx = pool.begin().await.map_err(ApiError::internal)?;
         lock(&mut tx).await?;
+        sqlx::raw_sql(include_str!("templates/app-schema.sql"))
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
         sqlx::raw_sql(include_str!("templates/extensions.sql"))
             .execute(&mut *tx)
             .await

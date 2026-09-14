@@ -228,10 +228,6 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
         .connect(&url)
         .await
         .unwrap();
-    sqlx::raw_sql(include_str!("../src/application/templates/app-schema.sql"))
-        .execute(&pool)
-        .await
-        .unwrap();
     let registry = registry();
     registry.migrate(&pool).await.unwrap();
     registry.migrate(&pool).await.unwrap();
