@@ -13,7 +13,7 @@ version = "0.1.0"
 [features]
 default = []
 axum = ["dep:axum", "dep:tracing"]
-application = ["axum", "dep:sqlx", "dep:tokio", "dep:uuid", "dep:sha2", "dep:base64", "dep:reqwest", "dep:aws-sdk-sesv2"]
+application = ["axum", "dep:sqlx", "dep:tokio", "dep:uuid", "dep:sha2", "dep:hmac", "dep:base64", "dep:reqwest", "dep:aws-sdk-sesv2"]
 
 [dependencies]
 async-trait = "0.1.91"
@@ -31,6 +31,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal"]
 uuid = { version = "1.22.0", features = ["serde", "v4"] , optional = true }
 
 sha2 = { version = "0.10.9", optional = true }
+hmac = { version = "0.12.1", optional = true }
 
 base64 = { version = "0.22.1", optional = true }
 

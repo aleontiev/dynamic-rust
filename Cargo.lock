@@ -639,6 +639,7 @@ dependencies = [
  "aws-sdk-sesv2",
  "axum",
  "base64",
+ "hmac",
  "reqwest",
  "serde",
  "serde_json",

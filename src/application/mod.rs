@@ -19,6 +19,7 @@ pub mod task_runner;
 
 pub mod google_auth;
 mod magic_auth;
+pub mod operator;
 mod preview;
 pub use google_auth::GoogleAuth;
 
@@ -51,6 +52,9 @@ pub struct App {
     /// roles: the platform sets the project owners here so a new app is usable
     /// before anyone holds a custom role. Never taken from app data.
     pub superusers: BTreeSet<String>,
+    /// Shared secret the publishing platform uses to open short-lived sessions
+    /// for named users through `/api/operator/session`; absent disables it.
+    pub operator_secret: Option<String>,
 }
 impl App {
     /// The actor for a signed-in user record, with the superuser flag applied.
@@ -431,6 +435,7 @@ pub fn router(app: App) -> Router {
         .route("/preview/issue",axum::routing::post(preview::issue)).route("/preview/redeem",axum::routing::post(preview::redeem))
         .route("/auth/magic-link",axum::routing::post(magic_auth::request_link))
         .route("/auth/verify",axum::routing::post(magic_auth::verify))
+        .route("/operator/session",axum::routing::post(operator::session))
         .route("/auth/google",get(google_auth::start))
         .route("/auth/google/callback",get(google_auth::callback))
         .route("/admin/",get(metadata).options(metadata)).route("/admin/users/me/",get(me))
@@ -496,6 +501,7 @@ pub fn configured(
         mail_endpoint: None,
         revision: std::env::var("APP_REVISION")?,
         superusers: parse_superusers(&std::env::var("APP_SUPERUSER_EMAILS").unwrap_or_default()),
+        operator_secret: operator::secret_from_env()?,
     })
 }
 async fn bootstrap() -> Result<(), ApiError> {

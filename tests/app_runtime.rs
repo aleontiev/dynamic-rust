@@ -41,9 +41,12 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
-        Self::with_preview(false).await
+        Self::configure(false, None).await
     }
     async fn with_preview(preview: bool) -> Self {
+        Self::configure(preview, None).await
+    }
+    async fn configure(preview: bool, operator_secret: Option<&str>) -> Self {
         let url = std::env::var("DREAM_TEST_DATABASE_URL").expect("set DREAM_TEST_DATABASE_URL");
         let admin = PgPoolOptions::new()
             .max_connections(1)
@@ -118,7 +121,8 @@ impl Fixture {
             branding: json!({"company_name":"Example Company","primary_color":"#123456","accent_color":"#abcdef"}),
             mail_endpoint: Some(mail_endpoint),
             revision: "immutable-revision".into(),
-            superusers: std::collections::BTreeSet::default(),
+            superusers: ["owner@example.org".to_string()].into_iter().collect(),
+            operator_secret: operator_secret.map(str::to_owned),
         });
         Self {
             admin,
@@ -227,6 +231,7 @@ async fn custom_login_branding_is_text_and_cannot_inject_markup() {
         mail_endpoint: None,
         revision: "test".into(),
         superusers: std::collections::BTreeSet::default(),
+        operator_secret: None,
         branding: json!({"company_name":"<script>alert(1)</script>","logo_url":"javascript:alert(2)","primary_color":"red;}</style><script>alert(3)</script>","accent_color":"#abcdef"}),
     });
     let (status, headers, html) = call(&app, "GET", "/api/login/", None).await;
@@ -1013,4 +1018,62 @@ async fn preview_handoffs_are_origin_checked_expiring_one_use_and_partitioned() 
         401
     );
     fixture.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn operator_grants_open_sessions_for_named_users_only_when_valid() {
+    use dynamic_rust::application::operator::{GRANT_SECONDS, sign};
+    let secret = "operator-secret-for-tests-0123456789abcdef";
+    let f = Fixture::configure(false, Some(secret)).await;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let expires = now + 60;
+    // Wrong signature, wrong email for the signature, expired, and too far ahead are all rejected.
+    for grant in [
+        json!({"email":"owner@example.org","expires":expires,"signature":"0".repeat(64)}),
+        json!({"email":"other@example.org","expires":expires,"signature":sign(secret,"owner@example.org",expires)}),
+        json!({"email":"owner@example.org","expires":now-1,"signature":sign(secret,"owner@example.org",now-1)}),
+        json!({"email":"owner@example.org","expires":now+GRANT_SECONDS+60,"signature":sign(secret,"owner@example.org",now+GRANT_SECONDS+60)}),
+    ] {
+        assert_eq!(
+            post(&f.app, "/api/operator/session", grant, None).await.0,
+            401
+        );
+    }
+    let (status, _, session) = post(
+        &f.app,
+        "/api/operator/session",
+        json!({"email":"Owner@Example.org","expires":expires,"signature":sign(secret,"owner@example.org",expires)}),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{session}");
+    assert_eq!(session["superuser"], true);
+    let cookie = format!("dream_app={}", session["token"].as_str().unwrap());
+    let (status, _, me) = call(&f.app, "GET", "/api/admin/users/me/", Some(&cookie)).await;
+    assert_eq!(status, 200, "{me}");
+    assert_eq!(me["user"]["email"], "owner@example.org");
+    // A second grant reuses the same user record rather than creating another.
+    let (_, _, again) = post(
+        &f.app,
+        "/api/operator/session",
+        json!({"email":"owner@example.org","expires":expires,"signature":sign(secret,"owner@example.org",expires)}),
+        None,
+    )
+    .await;
+    assert_eq!(again["user"], session["user"]);
+    // Without a configured secret the endpoint is unauthenticated for everyone.
+    let plain = Fixture::new().await;
+    assert_eq!(
+        post(&plain.app, "/api/operator/session", json!({"email":"owner@example.org","expires":expires,"signature":sign(secret,"owner@example.org",expires)}), None).await.0,
+        401
+    );
+    plain.close().await;
+    f.close().await;
 }

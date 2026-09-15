@@ -128,6 +128,7 @@ impl Fixture {
             mail_endpoint: None,
             revision: "fixture".into(),
             superusers: std::collections::BTreeSet::default(),
+            operator_secret: None,
         };
         let app = router(config.clone());
         Self {

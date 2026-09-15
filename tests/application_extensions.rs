@@ -266,6 +266,7 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
         mail_endpoint: None,
         revision: "test".into(),
         superusers: dynamic_rust::application::parse_superusers(" Owner@Example.com ,ignored"),
+        operator_secret: None,
     };
     let app = router(appstate.clone());
     let buyer_cookie = "dream_app=buyer-token";
