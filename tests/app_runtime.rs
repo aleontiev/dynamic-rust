@@ -603,6 +603,20 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             );
         }
         assert!(!schema["sections"].as_array().unwrap().is_empty());
+        // Only the resources people administer are listed in the navigation
+        // drawer; the rest stay reachable but unlisted behind an empty section.
+        assert_eq!(
+            schema["section"],
+            if matches!(
+                kind,
+                "identities" | "identity_verifications" | "dashboards" | "views"
+            ) {
+                ""
+            } else {
+                "Core"
+            },
+            "unexpected navigation section for {kind}"
+        );
         assert_eq!(schema["permissions"]["fields"]["name"]["write"], false);
         assert_eq!(
             call(

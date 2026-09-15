@@ -143,6 +143,8 @@ impl Model {
     pub fn field(mut self, name: &str, kind: FieldKind) -> Self {
         self.resource.fields.push(Field {
             name: name.into(),
+            label: None,
+            description: None,
             source: name.into(),
             column: Some(name.into()),
             kind,
@@ -173,6 +175,22 @@ impl Model {
         if let Some(f) = self.resource.fields.iter_mut().find(|f| f.name == name) {
             f.required = true;
             f.nullable = false;
+        }
+        self
+    }
+    /// Human-readable name for a field, shown as the column heading and form
+    /// label. Without one the admin title-cases the field name.
+    pub fn label(mut self, name: &str, label: &str) -> Self {
+        if let Some(f) = self.resource.fields.iter_mut().find(|f| f.name == name) {
+            f.label = Some(label.into());
+        }
+        self
+    }
+    /// One-sentence explanation of what a field holds, shown as help text in
+    /// the admin and returned in the resource's OPTIONS document.
+    pub fn describe(mut self, name: &str, description: &str) -> Self {
+        if let Some(f) = self.resource.fields.iter_mut().find(|f| f.name == name) {
+            f.description = Some(description.into());
         }
         self
     }
@@ -903,7 +921,7 @@ pub fn metadata(model: &Model, actor: &Actor, registry: &Registry) -> Value {
     let resource = &model.resource;
     let fields: Map<String,Value>=resource.fields.iter().map(|f| {
         let typ=match f.kind {FieldKind::DateTime=>json!("datetime"), _=>serde_json::to_value(&f.kind).unwrap_or(Value::Null)};
-        (f.name.clone(),json!({"name":f.name,"label":crate::python_title(&f.name.replace('_'," ")),"type":typ,"read_only":f.read_only,"required":f.required,"nullable":f.nullable,"null":f.nullable,"many":f.many,"ui":true,"hidden":f.write_only,"deferred":f.deferred,"sortable":!f.write_only,"filterable":!f.write_only,"related_resource":f.related_resource}))
+        (f.name.clone(),json!({"name":f.name,"label":f.label.clone().unwrap_or_else(||crate::python_title(&f.name.replace('_'," "))),"description":f.description,"type":typ,"read_only":f.read_only,"required":f.required,"nullable":f.nullable,"null":f.nullable,"many":f.many,"ui":true,"hidden":f.write_only,"deferred":f.deferred,"sortable":!f.write_only,"filterable":!f.write_only,"related_resource":f.related_resource}))
     }).collect();
     let names: Vec<_> = resource
         .fields

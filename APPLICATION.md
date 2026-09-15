@@ -16,6 +16,8 @@ pub fn register(registry: &mut Registry) -> Result<(), ApiError> {
     registry.model(Model::new("suppliers", "supplier")
         .field("name", FieldKind::String).required("name")
         .field("email", FieldKind::Email)
+        .label("email", "Contact email")
+        .describe("email", "Where purchase orders for this supplier are sent.")
         .unique(&["email"])
         .grant("authenticated", &["list", "read", "create", "update"]))?;
     Ok(())
@@ -29,6 +31,13 @@ metadata, role grants, per-role field overrides, list columns and row filters.
 Row filters support boolean groups and exact comparisons, including `$user.id`.
 Declare filters for every permitted operation. Writes check both the existing and
 proposed row scope. Hidden/write-only fields are excluded from record responses.
+
+`.label(field, text)` and `.describe(field, text)` set the heading and help text
+the admin shows for a field; without a label it title-cases the field name, and
+without a description it shows none. `.metadata(json!({"section": ""}))` keeps a
+model out of the navigation drawer while leaving it routable and linkable — the
+built-in identities, identity verifications, dashboards and views ship that way,
+so only users, roles and providers are listed by default.
 
 Relationships use `.relation("supplier", "suppliers")`; `.required("supplier")`
 makes the reference mandatory. A referenced record must exist and be readable.

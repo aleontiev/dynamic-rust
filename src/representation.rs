@@ -114,6 +114,8 @@ mod tests {
     fn field(kind: FieldKind, decimal_places: Option<u32>) -> Field {
         Field {
             name: "value".into(),
+            label: None,
+            description: None,
             source: "value".into(),
             column: Some("value".into()),
             kind,

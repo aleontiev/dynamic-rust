@@ -92,6 +92,8 @@ mod tests {
     fn field(name: &str, many: bool, link: RelationLink) -> Field {
         Field {
             name: name.into(),
+            label: None,
+            description: None,
             source: name.into(),
             column: None,
             kind: FieldKind::Relation,

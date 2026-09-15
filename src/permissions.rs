@@ -294,6 +294,8 @@ mod tests {
             id_field: "id".into(),
             fields: vec![Field {
                 name: "secret".into(),
+                label: None,
+                description: None,
                 source: "secret".into(),
                 column: Some("secret".into()),
                 kind: FieldKind::String,

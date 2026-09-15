@@ -41,6 +41,14 @@ pub enum RelationLink {
 #[allow(clippy::struct_excessive_bools)]
 pub struct Field {
     pub name: String,
+    /// Human-readable field name for admin UIs. Falls back to a title-cased
+    /// version of `name` when the application declares nothing.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// One-sentence explanation of what the field holds, surfaced as help text
+    /// beside the input and in the OPTIONS document.
+    #[serde(default)]
+    pub description: Option<String>,
     pub source: String,
     /// Concrete legacy database column. `None` denotes a computed/reverse field.
     pub column: Option<String>,

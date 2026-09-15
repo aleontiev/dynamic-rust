@@ -123,6 +123,9 @@ fn registry() -> Registry {
                 .required("quantity")
                 .field("received", FieldKind::Integer)
                 .field("state", FieldKind::String)
+                .label("received", "Units received")
+                .describe("received", "How many units of the order have arrived.")
+                .describe("state", "Where the order is in the fulfilment process.")
                 .grant("buyer", &all)
                 .grant("viewer", &["list", "read"])
                 .hook(OrderHook),
@@ -295,6 +298,22 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
         "{meta}"
     );
     assert_eq!(meta["resources"]["orders"]["permissions"]["delete"], true);
+    // Declared labels and descriptions reach the admin; undeclared labels still
+    // fall back to the title-cased field name, and an undeclared description is
+    // null rather than absent so the client can rely on the key.
+    let fields = &meta["resources"]["orders"]["fields"];
+    assert_eq!(fields["received"]["label"], "Units received");
+    assert_eq!(
+        fields["received"]["description"],
+        "How many units of the order have arrived."
+    );
+    assert_eq!(fields["state"]["label"], "State");
+    assert_eq!(
+        fields["state"]["description"],
+        "Where the order is in the fulfilment process."
+    );
+    assert_eq!(fields["quantity"]["label"], "Quantity");
+    assert!(fields["quantity"]["description"].is_null());
     assert!(
         meta["resources"]["orders"]["actions"]
             .as_array()

@@ -171,6 +171,18 @@ fn fields(kind: &str) -> Vec<(&str, &str)> {
     });
     result
 }
+/// Navigation section for a built-in resource. An empty section keeps the
+/// resource fully usable — routable, searchable, and linkable from relations —
+/// while leaving it out of the admin's navigation drawer, the same convention
+/// Dynamic REST used. Identities, verifications, dashboards, and views are
+/// plumbing that an app's own users rarely browse directly, so only the three
+/// resources people administer are listed by default.
+fn section(kind: &str) -> &'static str {
+    match kind {
+        "identities" | "identity_verifications" | "dashboards" | "views" => "",
+        _ => "Core",
+    }
+}
 fn schema(kind: &str) -> Value {
     let icon = match kind {
         "users" => "account-group",
@@ -181,7 +193,7 @@ fn schema(kind: &str) -> Value {
         "views" => "table-eye",
         _ => "connection",
     };
-    let fields:Map<String,Value>=fields(kind).into_iter().map(|(name,typ)|(name.into(),json!({"name":name,"label":name.replace('_'," "),"type":typ,"read_only":true,"required":false,"nullable":true,"null":true,"many":false,"ui":true,"hidden":false,"deferred":false,"sortable":true,"filterable":typ!="json"}))).collect();
+    let fields:Map<String,Value>=fields(kind).into_iter().map(|(name,typ)|(name.into(),json!({"name":name,"label":crate::python_title(&name.replace('_'," ")),"type":typ,"read_only":true,"required":false,"nullable":true,"null":true,"many":false,"ui":true,"hidden":false,"deferred":false,"sortable":true,"filterable":typ!="json"}))).collect();
     let permissions: Map<String, Value> = fields
         .keys()
         .map(|name| {
@@ -192,7 +204,7 @@ fn schema(kind: &str) -> Value {
         })
         .collect();
     let field_names: Vec<_> = fields.keys().cloned().collect();
-    json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":kind.replace('_'," "),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":"Core","fields":fields,"permissions":{"list":true,"read":true,"create":false,"update":false,"delete":false,"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]})
+    json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":crate::python_title(&kind.replace('_'," ")),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":section(kind),"fields":fields,"permissions":{"list":true,"read":true,"create":false,"update":false,"delete":false,"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]})
 }
 async fn metadata(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     let actor = app.actor(&user(&app, &headers).await?);
