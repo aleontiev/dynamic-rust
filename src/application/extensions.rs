@@ -744,6 +744,14 @@ fn query_filters(
         } else {
             " AND ("
         });
+        if filter.operator == crate::FilterOperator::IsNull {
+            let expected = crate::FilterOperator::null_expected(&filter.values[0])
+                .ok_or_else(|| ApiError::Parse("isnull expects true/false or 1/0".into()))?;
+            expression(query, resource, &filter.field)?;
+            query.push(if expected { " IS NULL" } else { " IS NOT NULL" });
+            query.push(")");
+            continue;
+        }
         for (i, value) in filter.values.iter().enumerate() {
             if i > 0 {
                 query.push(" OR ");

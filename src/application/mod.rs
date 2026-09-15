@@ -246,7 +246,10 @@ fn filters(
             || !filter.relation.is_empty()
             || !matches!(
                 filter.operator,
-                FilterOperator::Eq | FilterOperator::In | FilterOperator::IContains
+                FilterOperator::Eq
+                    | FilterOperator::In
+                    | FilterOperator::IContains
+                    | FilterOperator::IsNull
             )
         {
             return Err(ApiError::Parse("Unsupported resource filter.".into()));
@@ -256,6 +259,17 @@ fn filters(
         } else {
             " AND ("
         });
+        if filter.operator == FilterOperator::IsNull {
+            let expected = filter
+                .values
+                .first()
+                .and_then(|value| FilterOperator::null_expected(value))
+                .ok_or_else(|| ApiError::Parse("isnull expects true/false or 1/0.".into()))?;
+            expression(query, &filter.field);
+            query.push(if expected { " IS NULL" } else { " IS NOT NULL" });
+            query.push(")");
+            continue;
+        }
         for (index, value) in filter.values.iter().enumerate() {
             if index > 0 {
                 query.push(" OR ");

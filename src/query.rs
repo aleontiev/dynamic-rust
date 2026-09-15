@@ -34,6 +34,16 @@ pub enum FilterOperator {
 }
 
 impl FilterOperator {
+    /// Interpret an `isnull` filter value the way Dynamic REST does: `1`, `true`
+    /// and `yes` ask for nulls; `0`, `false` and `no` ask for present values.
+    #[must_use]
+    pub fn null_expected(value: &str) -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "t" | "y" => Some(true),
+            "0" | "false" | "no" | "f" | "n" => Some(false),
+            _ => None,
+        }
+    }
     fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "in" => Self::In,

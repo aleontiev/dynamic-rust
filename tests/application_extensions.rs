@@ -332,6 +332,26 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
         .0,
         200
     );
+    // isnull filters work on custom models: every order has an id; none has a note yet.
+    let (status, listed) = request(
+        &app,
+        "GET",
+        "/api/admin/orders/?filter{id.isnull}=0&filter{received.isnull}=false",
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(listed["meta"]["total_results"], 1, "{listed}");
+    let (_, none) = request(
+        &app,
+        "GET",
+        "/api/admin/orders/?filter{state.isnull}=1",
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(none["meta"]["total_results"], 0, "{none}");
     // Business rules still apply to a superuser: approved orders cannot be deleted.
     assert_eq!(
         request(

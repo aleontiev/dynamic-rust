@@ -756,6 +756,38 @@ async fn core_runtime_lists_filter_projection_counts_and_resource_boundaries() {
         literal["meta"]["total_results"], 1,
         "wildcards must be literal: {literal}"
     );
+    // The admin UI's default list query asks for rows whose id is present.
+    let (status, _, present) = call(
+        &f.app,
+        "GET",
+        "/api/admin/roles/?filter{id.isnull}=0",
+        Some(&f.cookie),
+    )
+    .await;
+    assert_eq!(status, 200, "{present}");
+    assert_eq!(
+        present["meta"]["total_results"],
+        page["meta"]["total_results"]
+    );
+    let (_, _, absent) = call(
+        &f.app,
+        "GET",
+        "/api/admin/roles/?filter{id.isnull}=true",
+        Some(&f.cookie),
+    )
+    .await;
+    assert_eq!(absent["meta"]["total_results"], 0);
+    assert_eq!(
+        call(
+            &f.app,
+            "GET",
+            "/api/admin/roles/?filter{id.isnull}=maybe",
+            Some(&f.cookie)
+        )
+        .await
+        .0,
+        400
+    );
     let (_, _, projection) = call(
         &f.app,
         "GET",
