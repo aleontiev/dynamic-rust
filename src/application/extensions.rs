@@ -20,6 +20,10 @@ use uuid::Uuid;
 pub struct Actor {
     pub id: String,
     pub roles: BTreeSet<String>,
+    /// Bypasses model grants, row filters and action roles. Granted only to the
+    /// application's configured superusers (`APP_SUPERUSER_EMAILS`), never from
+    /// user data.
+    pub is_superuser: bool,
 }
 impl Actor {
     pub fn from_user(user: &Value) -> Self {
@@ -34,15 +38,30 @@ impl Actor {
         Self {
             id: user["id"].as_str().unwrap_or_default().into(),
             roles,
+            is_superuser: false,
         }
+    }
+    /// The actor for a user, marked as a superuser when that user's verified
+    /// email is one of `superusers` (case-insensitive).
+    #[must_use]
+    pub fn for_user(user: &Value, superusers: &BTreeSet<String>) -> Self {
+        let mut actor = Self::from_user(user);
+        actor.is_superuser = user["email"]
+            .as_str()
+            .is_some_and(|email| superusers.contains(&email.trim().to_ascii_lowercase()));
+        actor
     }
     #[must_use]
     pub fn principal(&self) -> Principal<'_> {
         Principal {
             id: &self.id,
             roles: &self.roles,
-            is_superuser: false,
+            is_superuser: self.is_superuser,
         }
+    }
+    #[must_use]
+    pub fn may_run(&self, action: &Action) -> bool {
+        self.is_superuser || action.roles.contains("*") || !action.roles.is_disjoint(&self.roles)
     }
 }
 
@@ -374,7 +393,7 @@ impl<'a> Context<'a> {
             &model.resource,
             Some(self.actor.principal()),
             operation,
-            false,
+            true,
         ) {
             return Err(ApiError::Forbidden);
         }
@@ -892,6 +911,6 @@ pub fn metadata(model: &Model, actor: &Actor, registry: &Registry) -> Value {
     }
     let effective = crate::resource_metadata(resource, Some(actor.principal()));
     value["permissions"] = effective["permissions"].clone();
-    value["actions"]=json!(registry.actions.iter().filter(|((kind,_),action)|kind==&resource.plural_name && (action.roles.contains("*") || !action.roles.is_disjoint(&actor.roles))).map(|((_,name),_)|json!({"name":name,"label":crate::python_title(name),"methods":["POST"],"detail":true,"url":format!("/api/admin/{}/{{id}}/actions/{}/",resource.plural_name,name)})).collect::<Vec<_>>());
+    value["actions"]=json!(registry.actions.iter().filter(|((kind,_),action)|kind==&resource.plural_name && actor.may_run(action)).map(|((_,name),_)|json!({"name":name,"label":crate::python_title(name),"methods":["POST"],"detail":true,"url":format!("/api/admin/{}/{{id}}/actions/{}/",resource.plural_name,name)})).collect::<Vec<_>>());
     value
 }

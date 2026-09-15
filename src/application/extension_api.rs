@@ -1,6 +1,6 @@
 use super::{
     App,
-    extensions::{Actor, Context, lock},
+    extensions::{Context, lock},
     user,
 };
 use crate::{ApiDocument, ApiError, PageMeta, QueryFeatures};
@@ -18,7 +18,7 @@ pub(super) async fn list(
     kind: String,
     query_string: Option<String>,
 ) -> Result<Json<ApiDocument>, ApiError> {
-    let actor = Actor::from_user(&user(&app, &headers).await?);
+    let actor = app.actor(&user(&app, &headers).await?);
     let features = QueryFeatures::parse(query_string.as_deref().unwrap_or(""), 1000)?;
     let mut tx = app.pool.begin().await.map_err(ApiError::internal)?;
     // Consistent count and results in one read snapshot.
@@ -45,7 +45,7 @@ pub(super) async fn retrieve(
     id: Uuid,
     query_string: Option<String>,
 ) -> Result<Json<ApiDocument>, ApiError> {
-    let actor = Actor::from_user(&user(&app, &headers).await?);
+    let actor = app.actor(&user(&app, &headers).await?);
     let mut conn = app.pool.acquire().await.map_err(ApiError::internal)?;
     let mut ctx = Context::new(&mut conn, &app.registry, actor);
     let mut row = ctx.get(&kind, id).await?;
@@ -86,7 +86,7 @@ async fn write(
     input: Value,
     operation: &str,
 ) -> Result<Json<ApiDocument>, ApiError> {
-    let actor = Actor::from_user(&user(&app, &headers).await?);
+    let actor = app.actor(&user(&app, &headers).await?);
     let input = unwrap(&app, &kind, input)?;
     let mut tx = app.pool.begin().await.map_err(ApiError::internal)?;
     lock(&mut tx).await?;
@@ -128,7 +128,7 @@ pub(super) async fn replace(
     Path((kind, id)): Path<(String, Uuid)>,
     Json(input): Json<Value>,
 ) -> Result<Json<ApiDocument>, ApiError> {
-    let actor = Actor::from_user(&user(&app, &headers).await?);
+    let actor = app.actor(&user(&app, &headers).await?);
     let model = app.registry.models.get(&kind).ok_or(ApiError::NotFound)?;
     let resource = crate::resource_for_principal_operation(
         &model.resource,
@@ -154,14 +154,14 @@ pub(super) async fn action(
     Path((kind, id, name)): Path<(String, Uuid, String)>,
     Json(input): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let actor = Actor::from_user(&user(&app, &headers).await?);
+    let actor = app.actor(&user(&app, &headers).await?);
     let action = app
         .registry
         .actions
         .get(&(kind.clone(), name))
         .ok_or(ApiError::NotFound)?
         .clone();
-    if !action.roles.contains("*") && action.roles.is_disjoint(&actor.roles) {
+    if !actor.may_run(&action) {
         return Err(ApiError::Forbidden);
     }
     let mut tx = app.pool.begin().await.map_err(ApiError::internal)?;

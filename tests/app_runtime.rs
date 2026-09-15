@@ -118,6 +118,7 @@ impl Fixture {
             branding: json!({"company_name":"Example Company","primary_color":"#123456","accent_color":"#abcdef"}),
             mail_endpoint: Some(mail_endpoint),
             revision: "immutable-revision".into(),
+            superusers: std::collections::BTreeSet::default(),
         });
         Self {
             admin,
@@ -225,6 +226,7 @@ async fn custom_login_branding_is_text_and_cannot_inject_markup() {
         google_auth: None,
         mail_endpoint: None,
         revision: "test".into(),
+        superusers: std::collections::BTreeSet::default(),
         branding: json!({"company_name":"<script>alert(1)</script>","logo_url":"javascript:alert(2)","primary_color":"red;}</style><script>alert(3)</script>","accent_color":"#abcdef"}),
     });
     let (status, headers, html) = call(&app, "GET", "/api/login/", None).await;

@@ -127,6 +127,7 @@ impl Fixture {
             branding: json!({}),
             mail_endpoint: None,
             revision: "fixture".into(),
+            superusers: std::collections::BTreeSet::default(),
         };
         let app = router(config.clone());
         Self {

@@ -233,15 +233,18 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
     registry.migrate(&pool).await.unwrap();
     let buyer = Uuid::new_v4();
     let viewer = Uuid::new_v4();
-    for (id, role, token) in [
-        (buyer, "buyer", "buyer-token"),
-        (viewer, "viewer", "viewer-token"),
+    let owner = Uuid::new_v4();
+    let newcomer = Uuid::new_v4();
+    // The owner and the newcomer hold no app role at all; only the owner's email is configured as a superuser.
+    for (id, role, token, roles) in [
+        (buyer, "buyer", "buyer-token", json!(["buyer"])),
+        (viewer, "viewer", "viewer-token", json!(["viewer"])),
+        (owner, "owner", "owner-token", json!([])),
+        (newcomer, "newcomer", "newcomer-token", json!([])),
     ] {
         sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'users',$2)")
             .bind(id)
-            .bind(
-                json!({"name":role,"email":format!("{role}@example.com"),"data":{"roles":[role]}}),
-            )
+            .bind(json!({"name":role,"email":format!("{role}@example.com"),"data":{"roles":roles}}))
             .execute(&pool)
             .await
             .unwrap();
@@ -262,10 +265,101 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
         branding: json!({}),
         mail_endpoint: None,
         revision: "test".into(),
+        superusers: dynamic_rust::application::parse_superusers(" Owner@Example.com ,ignored"),
     };
     let app = router(appstate.clone());
     let buyer_cookie = "dream_app=buyer-token";
     let viewer_cookie = "dream_app=viewer-token";
+    let owner_cookie = "dream_app=owner-token";
+    let newcomer_cookie = "dream_app=newcomer-token";
+    // Without a role, custom models are invisible; the configured superuser sees and may do everything.
+    let (_, meta) = request(&app, "OPTIONS", "/api/admin/", newcomer_cookie, Value::Null).await;
+    assert!(meta["resources"]["orders"].is_null());
+    assert!(meta["resources"]["suppliers"].is_null());
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/admin/orders/",
+            newcomer_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        403
+    );
+    let (_, meta) = request(&app, "OPTIONS", "/api/admin/", owner_cookie, Value::Null).await;
+    assert_eq!(
+        meta["resources"]["orders"]["permissions"]["create"], true,
+        "{meta}"
+    );
+    assert_eq!(meta["resources"]["orders"]["permissions"]["delete"], true);
+    assert!(
+        meta["resources"]["orders"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["name"] == "approve")
+    );
+    let (status, owner_supplier) = request(
+        &app,
+        "POST",
+        "/api/admin/suppliers/",
+        owner_cookie,
+        json!({"supplier":{"name":"Owner supplier"}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{owner_supplier}");
+    let (status, owner_order) = request(
+        &app,
+        "POST",
+        "/api/admin/orders/",
+        owner_cookie,
+        json!({"name":"PO-owner","supplier":owner_supplier["supplier"]["id"],"quantity":2}),
+    )
+    .await;
+    assert_eq!(status, 201, "{owner_order}");
+    let owner_order = owner_order["order"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &format!("/api/admin/orders/{owner_order}/actions/approve/"),
+            owner_cookie,
+            json!({})
+        )
+        .await
+        .0,
+        200
+    );
+    // Business rules still apply to a superuser: approved orders cannot be deleted.
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("/api/admin/orders/{owner_order}/"),
+            owner_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        409
+    );
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!(
+                "/api/admin/suppliers/{}/",
+                owner_supplier["supplier"]["id"].as_str().unwrap()
+            ),
+            newcomer_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        403
+    );
     let (status, meta) = request(&app, "OPTIONS", "/api/admin/", buyer_cookie, Value::Null).await;
     assert_eq!(status, 200);
     assert_eq!(meta["resources"]["orders"]["permissions"]["create"], true);
@@ -481,6 +575,7 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
     let actor = Actor {
         id: buyer.to_string(),
         roles: ["buyer".into()].into(),
+        is_superuser: false,
     };
     let mut tx = pool.begin().await.unwrap();
     dynamic_rust::application::extensions::lock(&mut tx)

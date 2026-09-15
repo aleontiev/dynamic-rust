@@ -11,7 +11,7 @@ use axum::{
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, QueryBuilder, postgres::PgPoolOptions};
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
 mod extension_api;
 pub mod extensions;
@@ -47,6 +47,26 @@ pub struct App {
     /// Private integration-test transport; never configured from environment or app data.
     pub mail_endpoint: Option<String>,
     pub revision: String,
+    /// Lower-cased emails that bypass model grants, row filters and action
+    /// roles: the platform sets the project owners here so a new app is usable
+    /// before anyone holds a custom role. Never taken from app data.
+    pub superusers: BTreeSet<String>,
+}
+impl App {
+    /// The actor for a signed-in user record, with the superuser flag applied.
+    #[must_use]
+    pub fn actor(&self, user: &Value) -> extensions::Actor {
+        extensions::Actor::for_user(user, &self.superusers)
+    }
+}
+/// Parse `APP_SUPERUSER_EMAILS`: comma, semicolon or whitespace separated, case-insensitive.
+#[must_use]
+pub fn parse_superusers(value: &str) -> BTreeSet<String> {
+    value
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(|email| email.trim().to_ascii_lowercase())
+        .filter(|email| email.contains('@'))
+        .collect()
 }
 fn hash(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
@@ -171,13 +191,13 @@ fn schema(kind: &str) -> Value {
     json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":kind.replace('_'," "),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":"Core","fields":fields,"permissions":{"list":true,"read":true,"create":false,"update":false,"delete":false,"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]})
 }
 async fn metadata(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
-    let actor = extensions::Actor::from_user(&user(&app, &headers).await?);
+    let actor = app.actor(&user(&app, &headers).await?);
     let mut resources: Map<String, Value> = KINDS
         .iter()
         .map(|k| ((*k).to_string(), schema(k)))
         .collect();
     for (name, model) in &app.registry.models {
-        if crate::operation_granted(&model.resource, Some(actor.principal()), "list", false) {
+        if crate::operation_granted(&model.resource, Some(actor.principal()), "list", true) {
             resources.insert(
                 name.clone(),
                 extensions::metadata(model, &actor, &app.registry),
@@ -193,9 +213,9 @@ async fn options(
     headers: HeaderMap,
     Path(kind): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let actor = extensions::Actor::from_user(&user(&app, &headers).await?);
+    let actor = app.actor(&user(&app, &headers).await?);
     if let Some(model) = app.registry.models.get(&kind) {
-        if !crate::operation_granted(&model.resource, Some(actor.principal()), "list", false) {
+        if !crate::operation_granted(&model.resource, Some(actor.principal()), "list", true) {
             return Err(ApiError::Forbidden);
         }
         return Ok(Json(extensions::metadata(model, &actor, &app.registry)));
@@ -461,6 +481,7 @@ pub fn configured(
         )?,
         mail_endpoint: None,
         revision: std::env::var("APP_REVISION")?,
+        superusers: parse_superusers(&std::env::var("APP_SUPERUSER_EMAILS").unwrap_or_default()),
     })
 }
 async fn bootstrap() -> Result<(), ApiError> {

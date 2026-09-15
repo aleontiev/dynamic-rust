@@ -2,7 +2,7 @@
 //! Lambda or a native loop. External providers must honor the task idempotency key.
 use super::{
     App, DOCUMENT,
-    extensions::{Actor, Context, lock},
+    extensions::{Context, lock},
 };
 use crate::ApiError;
 use serde_json::{Value, json};
@@ -39,7 +39,7 @@ pub async fn tick(app: &App) -> Result<bool, ApiError> {
         let handler = app.registry.tasks.get(&name).ok_or(ApiError::NotFound)?;
         let result = handler
             .run(
-                &mut Context::new(&mut tx, &app.registry, Actor::from_user(&user)),
+                &mut Context::new(&mut tx, &app.registry, app.actor(&user)),
                 json!({"task_id":id,"idempotency_key":key,"data":input}),
             )
             .await?;

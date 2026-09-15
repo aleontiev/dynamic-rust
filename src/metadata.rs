@@ -20,10 +20,11 @@ pub fn resource_metadata(resource: &Resource, principal: Option<Principal<'_>>) 
 
     let mut permissions = Map::new();
     if !resource.role_grants.is_empty() {
+        // A superuser principal is created only deliberately, so metadata reports its real access.
         for operation in ["create", "update", "delete", "list", "read"] {
             permissions.insert(
                 operation.into(),
-                Value::Bool(operation_granted(resource, principal, operation, false)),
+                Value::Bool(operation_granted(resource, principal, operation, true)),
             );
         }
     }
