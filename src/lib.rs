@@ -4,6 +4,7 @@
 //! public wire contract: resource metadata, query feature parsing, envelopes,
 //! pagination metadata, permissions, and storage traits.
 
+mod access;
 mod error;
 mod links;
 mod metadata;
@@ -17,6 +18,10 @@ mod router;
 mod selection;
 mod sideload;
 
+pub use access::{
+    AccessMap, AccessRules, AccessTargets, OPERATIONS as ACCESS_OPERATIONS, grant_access,
+    parse_access_map, parse_rule,
+};
 pub use error::{ApiError, ErrorBody, FieldErrors};
 pub use links::{LinkOptions, build_links};
 pub use metadata::{python_title, resource_metadata};

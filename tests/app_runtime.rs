@@ -629,6 +629,8 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             .0,
             200
         );
+        // Roles can be created by people whose roles allow it; this viewer's
+        // cannot. Every other built-in resource is read-only through the API.
         assert_eq!(
             call(
                 &f.app,
@@ -638,10 +640,10 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             )
             .await
             .0,
-            405
+            if kind == "roles" { 403 } else { 405 }
         );
     }
-    for method in ["PUT", "PATCH", "DELETE"] {
+    for (method, status) in [("PUT", 403), ("PATCH", 403), ("DELETE", 405)] {
         assert_eq!(
             call(
                 &f.app,
@@ -651,7 +653,7 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             )
             .await
             .0,
-            405
+            status
         );
     }
     for path in [

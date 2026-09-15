@@ -3,7 +3,8 @@
 //! actions and task effects share a transaction. No cloud credentials are needed.
 use super::DOCUMENT;
 use crate::{
-    ApiError, Field, FieldKind, PermissionFilter, Principal, QueryFeatures, RelationLink, Resource,
+    AccessMap, AccessTargets, ApiError, Field, FieldKind, PermissionFilter, Principal,
+    QueryFeatures, RelationLink, Resource,
 };
 use async_trait::async_trait;
 pub use async_trait::async_trait as handler;
@@ -24,14 +25,17 @@ pub struct Actor {
     /// application's configured superusers (`APP_SUPERUSER_EMAILS`), never from
     /// user data.
     pub is_superuser: bool,
+    /// The access maps of the roles this user holds, keyed by role name. They
+    /// are merged with the grants the code declares when a resource is resolved.
+    pub access: BTreeMap<String, AccessMap>,
 }
 impl Actor {
+    /// The actor for a user record before its stored roles are resolved: the
+    /// role entries that are not record ids are taken as role names, which is
+    /// how applications assigned roles before roles became records.
     pub fn from_user(user: &Value) -> Self {
-        let mut roles: BTreeSet<String> = user["data"]["roles"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
+        let mut roles: BTreeSet<String> = stored_roles(user)
+            .filter(|role| Uuid::parse_str(role).is_err())
             .map(str::to_owned)
             .collect();
         roles.insert("authenticated".into());
@@ -39,7 +43,32 @@ impl Actor {
             id: user["id"].as_str().unwrap_or_default().into(),
             roles,
             is_superuser: false,
+            access: BTreeMap::new(),
         }
+    }
+    /// The record ids among a user's stored roles.
+    #[must_use]
+    pub fn role_ids(user: &Value) -> Vec<Uuid> {
+        stored_roles(user)
+            .filter_map(|role| Uuid::parse_str(role).ok())
+            .collect()
+    }
+    /// Hold a stored role: its name joins the actor's roles, so grants the code
+    /// declares for that name apply, and its access map is merged at runtime.
+    pub fn hold(&mut self, name: &str, access: AccessMap) {
+        self.roles.insert(name.into());
+        self.access.insert(name.into(), access);
+    }
+    /// Whether a held role grants an operation on a resource unconditionally.
+    /// Built-in resources have no row filters, so this is their whole answer.
+    #[must_use]
+    pub fn granted(&self, resource: &str, operation: &str) -> bool {
+        self.is_superuser
+            || self.access.values().any(|map| {
+                map.get(resource)
+                    .and_then(|rules| rules.get(operation))
+                    .is_some_and(|rule| matches!(rule, PermissionFilter::All))
+            })
     }
     /// The actor for a user, marked as a superuser when that user's verified
     /// email is one of `superusers` (case-insensitive).
@@ -63,6 +92,21 @@ impl Actor {
     pub fn may_run(&self, action: &Action) -> bool {
         self.is_superuser || action.roles.contains("*") || !action.roles.is_disjoint(&self.roles)
     }
+}
+
+/// A user's stored roles, from either the public record (`roles`) or the raw
+/// document (`data.roles`).
+fn stored_roles(user: &Value) -> impl Iterator<Item = &str> {
+    let roles = &user["roles"];
+    if roles.is_array() {
+        roles
+    } else {
+        &user["data"]["roles"]
+    }
+    .as_array()
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
 }
 
 #[async_trait]
@@ -245,6 +289,39 @@ pub struct Registry {
     pub migrations: BTreeMap<String, String>,
 }
 impl Registry {
+    /// A model's resource with the actor's stored roles merged into its grants.
+    #[must_use]
+    pub fn resource_for(&self, kind: &str, actor: &Actor) -> Option<Resource> {
+        let model = self.models.get(kind)?;
+        let mut resource = model.resource.clone();
+        for (role, access) in &actor.access {
+            if let Some(rules) = access.get(kind) {
+                crate::grant_access(&mut resource, role, rules);
+            }
+        }
+        Some(resource)
+    }
+    /// What an access map may name: every registered model with its fields.
+    /// The application adds its built-in resources, which take only booleans.
+    #[must_use]
+    pub fn access_targets(&self) -> AccessTargets {
+        self.models
+            .iter()
+            .map(|(name, model)| {
+                (
+                    name.clone(),
+                    Some(
+                        model
+                            .resource
+                            .fields
+                            .iter()
+                            .map(|f| f.name.clone())
+                            .collect(),
+                    ),
+                )
+            })
+            .collect()
+    }
     /// Register a model. Rejects reserved/duplicate names, invalid fields and invalid unique constraints.
     ///
     /// # Errors
@@ -406,13 +483,11 @@ impl<'a> Context<'a> {
         }
     }
     fn effective(&self, kind: &str, operation: &str) -> Result<Resource, ApiError> {
-        let model = self.registry.models.get(kind).ok_or(ApiError::NotFound)?;
-        if !crate::operation_granted(
-            &model.resource,
-            Some(self.actor.principal()),
-            operation,
-            true,
-        ) {
+        let resource = self
+            .registry
+            .resource_for(kind, &self.actor)
+            .ok_or(ApiError::NotFound)?;
+        if !crate::operation_granted(&resource, Some(self.actor.principal()), operation, true) {
             return Err(ApiError::Forbidden);
         }
         let method = match operation {
@@ -422,7 +497,7 @@ impl<'a> Context<'a> {
             _ => "GET",
         };
         Ok(crate::resource_for_principal_operation(
-            &model.resource,
+            &resource,
             Some(self.actor.principal()),
             method,
             operation,
@@ -918,7 +993,9 @@ fn check_proposed_scope(resource: &Resource, record: &Value) -> Result<(), ApiEr
 }
 
 pub fn metadata(model: &Model, actor: &Actor, registry: &Registry) -> Value {
-    let resource = &model.resource;
+    let resource = &registry
+        .resource_for(&model.resource.plural_name, actor)
+        .unwrap_or_else(|| model.resource.clone());
     let fields: Map<String,Value>=resource.fields.iter().map(|f| {
         let typ=match f.kind {FieldKind::DateTime=>json!("datetime"), _=>serde_json::to_value(&f.kind).unwrap_or(Value::Null)};
         (f.name.clone(),json!({"name":f.name,"label":f.label.clone().unwrap_or_else(||crate::python_title(&f.name.replace('_'," "))),"description":f.description,"type":typ,"read_only":f.read_only,"required":f.required,"nullable":f.nullable,"null":f.nullable,"many":f.many,"ui":true,"hidden":f.write_only,"deferred":f.deferred,"sortable":!f.write_only,"filterable":!f.write_only,"related_resource":f.related_resource}))

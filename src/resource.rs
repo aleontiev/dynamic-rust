@@ -118,7 +118,7 @@ pub enum PermissionFilter {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Resource {
     pub namespace: String,
     pub name: String,

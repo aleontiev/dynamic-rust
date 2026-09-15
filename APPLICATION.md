@@ -25,12 +25,43 @@ pub fn register(registry: &mut Registry) -> Result<(), ApiError> {
 ```
 
 Default access is denied. `authenticated` is assigned to signed-in users; other
-roles come from the user's server-owned `data.roles` array, never request headers.
-Core identity resources remain read-only. `Model.resource` exposes Dynamic Rust's
-metadata, role grants, per-role field overrides, list columns and row filters.
-Row filters support boolean groups and exact comparisons, including `$user.id`.
-Declare filters for every permitted operation. Writes check both the existing and
-proposed row scope. Hidden/write-only fields are excluded from record responses.
+roles come from the user's server-owned `roles` list, never request headers.
+`Model.resource` exposes Dynamic Rust's metadata, role grants, per-role field
+overrides, list columns and row filters. Row filters support boolean groups and
+exact comparisons, including `$user.id`. A role granted an operation without a
+filter is unrestricted for it. Writes check both the existing and proposed row
+scope. Hidden/write-only fields are excluded from record responses.
+
+## Stored roles
+
+Roles are also records: `/api/admin/roles/` holds a `name` and a `permissions`
+access map, grouped by resource and operation. A rule is `true`, `false`, or a
+condition the rows must meet — an object of field names whose values are
+scalars or `$user.id`, or `$or`, `$and` and `$not` groups of conditions:
+
+```json
+{"orders": {"list": true, "read": true, "create": true,
+            "update": {"$or": [{"state": "draft"}, {"owner": "$user.id"}]}},
+ "suppliers": {"list": true, "read": true},
+ "users": {"list": true, "read": true, "update": true}}
+```
+
+Users hold roles by id in their `roles` field. On every request the runtime
+loads the held roles, adds each role's name to the actor (so grants declared in
+code for that name apply too) and merges its access map into the resources it
+names, with union semantics: any role that grants an operation grants it, and
+conditions are OR-ed with each other and with the code's row filters. A model
+that declares no grants is open to every signed-in user, so rules for it change
+nothing. Built-in resources take only `true` or `false`. Maps are validated when
+saved; `OPTIONS /api/admin/roles/` lists the resources rules may name under the
+`permissions` field, marking which accept conditions.
+
+Superusers, and holders of a role whose map grants those operations on `roles`
+and `users`, create, edit and delete roles and set the `roles` (and `name`) of
+users; deleting a role removes it from every user. Everything else built in
+remains read-only. Role names must be unique; `*` and `authenticated` are
+reserved. Role entries on a user that are not record ids are still treated as
+role names, so applications that assigned roles by name keep working.
 
 `.label(field, text)` and `.describe(field, text)` set the heading and help text
 the admin shows for a field; without a label it title-cases the field name, and

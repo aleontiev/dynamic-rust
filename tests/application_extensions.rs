@@ -402,7 +402,10 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
     );
     let (status, meta) = request(&app, "OPTIONS", "/api/admin/", buyer_cookie, Value::Null).await;
     assert_eq!(status, 200);
-    assert_eq!(meta["resources"]["orders"]["permissions"]["create"], true);
+    assert_eq!(
+        meta["resources"]["orders"]["permissions"]["create"], true,
+        "{meta}"
+    );
     let (_, meta) = request(&app, "OPTIONS", "/api/admin/", viewer_cookie, Value::Null).await;
     assert_eq!(meta["resources"]["orders"]["permissions"]["create"], false);
     assert!(meta["resources"]["suppliers"].is_null());
@@ -616,6 +619,7 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
         id: buyer.to_string(),
         roles: ["buyer".into()].into(),
         is_superuser: false,
+        access: std::collections::BTreeMap::default(),
     };
     let mut tx = pool.begin().await.unwrap();
     dynamic_rust::application::extensions::lock(&mut tx)
@@ -634,4 +638,564 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
         .await
         .unwrap();
     admin.close().await;
+}
+
+/// Roles stored as records: their access maps merge with the grants the code
+/// declares, follow the user around as they navigate, and are managed through
+/// the API by superusers and by anyone a role lets manage them.
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() {
+    let url = std::env::var("DREAM_TEST_DATABASE_URL").unwrap();
+    let admin = PgPool::connect(&url).await.unwrap();
+    let schema = format!("roles_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let search = schema.clone();
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .after_connect(move |conn, _| {
+            let query = format!("SET search_path TO {search}");
+            Box::pin(async move {
+                sqlx::query(&query).execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .unwrap();
+    let registry = registry();
+    registry.migrate(&pool).await.unwrap();
+    let owner = Uuid::new_v4();
+    let clerk = Uuid::new_v4();
+    let auditor = Uuid::new_v4();
+    for (id, name, token) in [
+        (owner, "owner", "owner-token"),
+        (clerk, "clerk", "clerk-token"),
+        (auditor, "auditor", "auditor-token"),
+    ] {
+        sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'users',$2)")
+            .bind(id)
+            .bind(json!({"name":name,"email":format!("{name}@example.com"),"data":{"roles":[],"team":"ops"}}))
+            .execute(&pool)
+            .await
+            .unwrap();
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+        sqlx::query("INSERT INTO app_sessions(digest,user_id,expires) VALUES($1,$2,now()+interval '1 hour')").bind(digest).bind(id).execute(&pool).await.unwrap();
+    }
+    let app = router(App {
+        pool: pool.clone(),
+        registry: Arc::new(registry),
+        name: "Procurement".into(),
+        origin: "https://example.com".into(),
+        preview_origins: vec![],
+        mail_from: "noreply@example.com".into(),
+        mail_region: "us-east-1".into(),
+        mail_api_key: None,
+        google_auth: None,
+        branding: json!({}),
+        mail_endpoint: None,
+        revision: "test".into(),
+        superusers: dynamic_rust::application::parse_superusers("owner@example.com"),
+        operator_secret: None,
+    });
+    let (owner_cookie, clerk_cookie, auditor_cookie) = (
+        "dream_app=owner-token",
+        "dream_app=clerk-token",
+        "dream_app=auditor-token",
+    );
+
+    // The permissions field tells an editor which resources rules may name and
+    // which of them accept conditions; built-ins take only true or false.
+    let (_, meta) = request(
+        &app,
+        "OPTIONS",
+        "/api/admin/roles/",
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    let resources = &meta["fields"]["permissions"]["resources"];
+    assert_eq!(meta["fields"]["permissions"]["type"], "permissions");
+    assert_eq!(resources["orders"]["conditional"], true);
+    assert_eq!(resources["users"]["conditional"], false);
+    assert!(
+        resources["identities"].is_null(),
+        "plumbing resources are not offered"
+    );
+    assert_eq!(meta["permissions"]["create"], true);
+    assert_eq!(meta["fields"]["name"]["read_only"], false);
+    let (_, meta) = request(
+        &app,
+        "OPTIONS",
+        "/api/admin/roles/",
+        clerk_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(meta["permissions"]["create"], false);
+    assert_eq!(meta["fields"]["name"]["read_only"], true);
+
+    // Only people whose roles allow it manage roles; maps are validated on save.
+    let permissions = json!({
+        "orders": {"list": true, "read": true, "create": true, "update": {"$or": [{"state": "draft"}, {"quantity": 1}]}, "delete": false},
+        "suppliers": {"list": true, "read": true},
+        "users": {"list": true}
+    });
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/admin/roles/",
+            clerk_cookie,
+            json!({"name":"Clerk","permissions":permissions})
+        )
+        .await
+        .0,
+        403
+    );
+    for (body, field, message) in [
+        (json!({"name":"authenticated"}), "name", "reserved"),
+        (json!({"name":""}), "name", "1 to 100"),
+        (
+            json!({"name":"Clerk","permissions":{"orders":{"fly":true}}}),
+            "permissions",
+            "unknown operation fly",
+        ),
+        (
+            json!({"name":"Clerk","permissions":{"orders":{"list":{"colour":"red"}}}}),
+            "permissions",
+            "unknown field colour",
+        ),
+        (
+            json!({"name":"Clerk","permissions":{"users":{"list":{"name":"x"}}}}),
+            "permissions",
+            "only true or false",
+        ),
+        (
+            json!({"name":"Clerk","permissions":{"rockets":{"list":true}}}),
+            "permissions",
+            "Unknown resource: rockets",
+        ),
+    ] {
+        let (status, error) = request(&app, "POST", "/api/admin/roles/", owner_cookie, body).await;
+        assert_eq!(status, 400, "{error}");
+        assert!(
+            error["detail"][field][0]
+                .as_str()
+                .unwrap()
+                .contains(message),
+            "{error}"
+        );
+    }
+    let (status, created) = request(
+        &app,
+        "POST",
+        "/api/admin/roles/",
+        owner_cookie,
+        json!({"role":{"name":"Clerk","permissions":permissions}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    let role = created["role"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["role"]["permissions"], permissions);
+    let (status, error) = request(
+        &app,
+        "POST",
+        "/api/admin/roles/",
+        owner_cookie,
+        json!({"name":"clerk"}),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(
+        error["detail"]["name"][0]
+            .as_str()
+            .unwrap()
+            .contains("already exists")
+    );
+
+    // Holding no role, the clerk sees nothing custom.
+    let (_, meta) = request(&app, "OPTIONS", "/api/admin/", clerk_cookie, Value::Null).await;
+    assert!(meta["resources"]["orders"].is_null());
+    assert_eq!(
+        request(&app, "GET", "/api/admin/orders/", clerk_cookie, Value::Null)
+            .await
+            .0,
+        403
+    );
+
+    // Roles are assigned by id on the user record, by someone allowed to.
+    assert_eq!(
+        request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/users/{clerk}/"),
+            clerk_cookie,
+            json!({"roles":[role]})
+        )
+        .await
+        .0,
+        403
+    );
+    let (status, error) = request(
+        &app,
+        "PATCH",
+        &format!("/api/admin/users/{clerk}/"),
+        owner_cookie,
+        json!({"roles":[Uuid::new_v4()]}),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(error["detail"]["roles"][0], "Unknown role.");
+    let (status, updated) = request(
+        &app,
+        "PATCH",
+        &format!("/api/admin/users/{clerk}/"),
+        owner_cookie,
+        json!({"user":{"roles":[role]}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["user"]["roles"], json!([role]));
+    assert_eq!(
+        updated["user"]["data"],
+        json!({"team":"ops"}),
+        "the rest of the user's data is untouched"
+    );
+    let (_, me) = request(
+        &app,
+        "GET",
+        "/api/admin/users/me/",
+        clerk_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(me["user"]["roles"], json!([role]));
+
+    // From the next request on, the clerk navigates with the role's access.
+    let (_, meta) = request(&app, "OPTIONS", "/api/admin/", clerk_cookie, Value::Null).await;
+    let orders = &meta["resources"]["orders"]["permissions"];
+    assert_eq!(
+        (
+            orders["list"].clone(),
+            orders["create"].clone(),
+            orders["update"].clone(),
+            orders["delete"].clone()
+        ),
+        (json!(true), json!(true), json!(true), json!(false)),
+        "{meta}"
+    );
+    assert_eq!(
+        meta["resources"]["suppliers"]["permissions"]["create"],
+        false
+    );
+    assert!(
+        meta["resources"]["receipts"].is_null(),
+        "resources no role grants stay invisible"
+    );
+    assert_eq!(meta["resources"]["users"]["permissions"]["update"], false);
+    let (status, supplier) = request(
+        &app,
+        "POST",
+        "/api/admin/suppliers/",
+        owner_cookie,
+        json!({"name":"Acme"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{supplier}");
+    let supplier = supplier["supplier"]["id"].clone();
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/admin/suppliers/",
+            clerk_cookie,
+            json!({"name":"Nope"})
+        )
+        .await
+        .0,
+        403
+    );
+    let (status, order) = request(
+        &app,
+        "POST",
+        "/api/admin/orders/",
+        clerk_cookie,
+        json!({"name":"Paper","supplier":supplier,"quantity":5}),
+    )
+    .await;
+    assert_eq!(status, 201, "{order}");
+    let order = order["order"]["id"].as_str().unwrap().to_owned();
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("/api/admin/orders/{order}/"),
+        clerk_cookie,
+        json!({"name":"Paper (draft)"}),
+    )
+    .await;
+    assert_eq!(status, 200, "a draft order matches the update condition");
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("/api/admin/orders/{order}/"),
+            clerk_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        403
+    );
+    sqlx::query("UPDATE app_records SET data=data||'{\"state\":\"approved\"}' WHERE id=$1")
+        .bind(Uuid::parse_str(&order).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &format!("/api/admin/orders/{order}/"),
+            clerk_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        200,
+        "reading is unconditional"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/orders/{order}/"),
+            clerk_cookie,
+            json!({"name":"Paper (approved)"})
+        )
+        .await
+        .0,
+        404,
+        "an approved order with quantity 5 is outside the update condition"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/orders/{order}/"),
+            clerk_cookie,
+            json!({"quantity":1})
+        )
+        .await
+        .0,
+        404,
+        "the condition applies to the row as it is, not as proposed"
+    );
+
+    // Editing the role changes what its holders may do on their next request.
+    let (status, edited) = request(
+        &app,
+        "PATCH",
+        &format!("/api/admin/roles/{role}/"),
+        owner_cookie,
+        json!({"permissions":{"orders":{"list":true,"read":true,"update":true},"suppliers":{"list":true,"read":true}}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{edited}");
+    assert_eq!(edited["role"]["name"], "Clerk");
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        &format!("/api/admin/orders/{order}/"),
+        clerk_cookie,
+        json!({"name":"Paper (approved)"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body} {edited}");
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/admin/orders/",
+            clerk_cookie,
+            json!({"name":"Pens","supplier":supplier,"quantity":2})
+        )
+        .await
+        .0,
+        403
+    );
+    let (_, meta) = request(&app, "OPTIONS", "/api/admin/", clerk_cookie, Value::Null).await;
+    assert_eq!(meta["resources"]["orders"]["permissions"]["create"], false);
+    assert!(
+        meta["resources"]["users"]["permissions"]["list"]
+            .as_bool()
+            .unwrap()
+    );
+
+    // A role that manages roles and users delegates administration.
+    let (status, admins) = request(&app, "POST", "/api/admin/roles/", owner_cookie, json!({"name":"Admin","permissions":{"roles":{"list":true,"read":true,"create":true,"update":true,"delete":true},"users":{"list":true,"read":true,"update":true}}})).await;
+    assert_eq!(status, 201, "{admins}");
+    let admins = admins["role"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/users/{auditor}/"),
+            owner_cookie,
+            json!({"roles":[admins]})
+        )
+        .await
+        .0,
+        200
+    );
+    let (_, meta) = request(&app, "OPTIONS", "/api/admin/", auditor_cookie, Value::Null).await;
+    assert_eq!(meta["resources"]["roles"]["permissions"]["delete"], true);
+    assert_eq!(meta["resources"]["users"]["permissions"]["update"], true);
+    assert_eq!(
+        meta["resources"]["users"]["fields"]["roles"]["read_only"],
+        false
+    );
+    assert_eq!(
+        meta["resources"]["users"]["fields"]["roles"]["choices"],
+        json!([{"id":admins,"label":"Admin"},{"id":role,"label":"Clerk"}]),
+        "existing roles are the choices for a user's roles"
+    );
+    assert_eq!(
+        meta["resources"]["users"]["fields"]["email"]["read_only"],
+        true
+    );
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/admin/roles/",
+            auditor_cookie,
+            json!({"name":"Viewer","permissions":{}})
+        )
+        .await
+        .0,
+        201
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/users/{clerk}/"),
+            auditor_cookie,
+            json!({"name":"Clerk Two"})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/admin/users/",
+            auditor_cookie,
+            json!({"name":"x"})
+        )
+        .await
+        .0,
+        405
+    );
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("/api/admin/users/{clerk}/"),
+            auditor_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        405
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/admin/orders/",
+            auditor_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        403,
+        "managing roles grants nothing else"
+    );
+
+    // Deleting a role removes it from its holders, who lose its access at once.
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("/api/admin/roles/{role}/"),
+            auditor_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        204
+    );
+    let (_, user) = request(
+        &app,
+        "GET",
+        &format!("/api/admin/users/{clerk}/"),
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(user["user"]["roles"], json!([]));
+    assert_eq!(user["user"]["name"], "Clerk Two");
+    assert_eq!(
+        request(&app, "GET", "/api/admin/orders/", clerk_cookie, Value::Null)
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &format!("/api/admin/roles/{role}/"),
+            owner_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        404
+    );
+
+    // Legacy role names on a user still match the grants declared in code.
+    sqlx::query(
+        "UPDATE app_records SET data=jsonb_set(data,'{data,roles}','[\"buyer\"]') WHERE id=$1",
+    )
+    .bind(clerk)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/admin/receipts/",
+            clerk_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        200
+    );
+
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

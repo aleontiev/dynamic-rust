@@ -33,6 +33,15 @@ pub fn row_filter(
             .get(role)
             .and_then(|operations| operations.get(operation))
         else {
+            // A role granted the operation without declaring a row filter is
+            // unrestricted; only roles with a filter narrow what they see.
+            if resource
+                .role_grants
+                .get(role)
+                .is_some_and(|operations| operations.iter().any(|value| value == operation))
+            {
+                return PermissionFilter::All;
+            }
             continue;
         };
         if matches!(filter, PermissionFilter::All) {

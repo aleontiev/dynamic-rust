@@ -39,7 +39,7 @@ pub async fn tick(app: &App) -> Result<bool, ApiError> {
         let handler = app.registry.tasks.get(&name).ok_or(ApiError::NotFound)?;
         let result = handler
             .run(
-                &mut Context::new(&mut tx, &app.registry, app.actor(&user)),
+                &mut Context::new(&mut tx, &app.registry, app.actor(&user).await?),
                 json!({"task_id":id,"idempotency_key":key,"data":input}),
             )
             .await?;

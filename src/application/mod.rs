@@ -4,7 +4,7 @@ use crate::{ApiDocument, ApiError, FilterOperator, PageMeta, QueryFeatures};
 use axum::{
     Json, Router,
     extract::{Path, RawQuery, State},
-    http::{HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
@@ -17,6 +17,7 @@ mod extension_api;
 pub mod extensions;
 pub mod task_runner;
 
+mod core;
 pub mod google_auth;
 mod magic_auth;
 pub mod operator;
@@ -57,10 +58,42 @@ pub struct App {
     pub operator_secret: Option<String>,
 }
 impl App {
-    /// The actor for a signed-in user record, with the superuser flag applied.
+    /// The actor for a signed-in user record: the superuser flag applied and
+    /// the roles the user holds loaded, so their access maps apply to this
+    /// request. A role deleted since it was assigned is simply not held.
+    ///
+    /// # Errors
+    /// Returns database failures while loading the user's roles.
+    pub async fn actor(&self, user: &Value) -> Result<extensions::Actor, ApiError> {
+        let mut actor = extensions::Actor::for_user(user, &self.superusers);
+        let ids = extensions::Actor::role_ids(user);
+        if ids.is_empty() {
+            return Ok(actor);
+        }
+        let roles: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT data->>'name',coalesce(data->'permissions','{}'::jsonb) FROM app_records WHERE kind='roles' AND id=ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        let targets = self.access_targets();
+        for (name, permissions) in roles {
+            // Maps are validated when saved; anything unreadable grants nothing.
+            let access = crate::parse_access_map(&permissions, &targets).unwrap_or_default();
+            actor.hold(&name, access);
+        }
+        Ok(actor)
+    }
+    /// What a role's access map may name: registered models with their fields,
+    /// and the built-in resources, which take only `true` or `false`.
     #[must_use]
-    pub fn actor(&self, user: &Value) -> extensions::Actor {
-        extensions::Actor::for_user(user, &self.superusers)
+    pub fn access_targets(&self) -> crate::AccessTargets {
+        let mut targets = self.registry.access_targets();
+        for kind in KINDS {
+            targets.insert(kind.into(), None);
+        }
+        targets
     }
 }
 /// Parse `APP_SUPERUSER_EMAILS`: comma, semicolon or whitespace separated, case-insensitive.
@@ -112,6 +145,15 @@ async fn user(app: &App, headers: &HeaderMap) -> Result<Value, ApiError> {
 }
 fn public_record(kind: &str, mut record: Value) -> Value {
     if let Some(object) = record.as_object_mut() {
+        if kind == "users" {
+            // Held roles are a first-class field; the rest of `data` is the app's.
+            let roles = object
+                .get_mut("data")
+                .and_then(Value::as_object_mut)
+                .and_then(|data| data.remove("roles"))
+                .unwrap_or_else(|| json!([]));
+            object.insert("roles".into(), roles);
+        }
         object.retain(|name, _| fields(kind).iter().any(|(field, _)| field == name));
     }
     record
@@ -147,7 +189,12 @@ fn fields(kind: &str) -> Vec<(&str, &str)> {
         ("updated", "datetime"),
     ];
     result.extend(match kind {
-        "users" => vec![("name", "string"), ("email", "email"), ("data", "json")],
+        "users" => vec![
+            ("name", "string"),
+            ("email", "email"),
+            ("roles", "list"),
+            ("data", "json"),
+        ],
         "identities" => vec![
             ("name", "string"),
             ("user", "uuid"),
@@ -160,7 +207,7 @@ fn fields(kind: &str) -> Vec<(&str, &str)> {
             ("verified", "boolean"),
             ("method", "string"),
         ],
-        "roles" => vec![("name", "string"), ("permissions", "json")],
+        "roles" => vec![("name", "string"), ("permissions", "permissions")],
         "providers" => vec![
             ("name", "string"),
             ("kind", "string"),
@@ -183,7 +230,28 @@ fn section(kind: &str) -> &'static str {
         _ => "Core",
     }
 }
-fn schema(kind: &str) -> Value {
+/// Which built-in fields a person may write, given what their roles grant.
+fn writable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
+    match (kind, field) {
+        ("roles", "name" | "permissions") => actor.granted("roles", "update"),
+        ("users", "name" | "roles") => actor.granted("users", "update"),
+        _ => false,
+    }
+}
+/// The roles that exist, as choices for a user's `roles` field.
+async fn role_choices(app: &App) -> Result<Vec<Value>, ApiError> {
+    let roles: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id,coalesce(data->>'name','') FROM app_records WHERE kind='roles' ORDER BY lower(data->>'name'),id",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(roles
+        .into_iter()
+        .map(|(id, name)| json!({"id":id,"label":name}))
+        .collect())
+}
+fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> Value {
     let icon = match kind {
         "users" => "account-group",
         "identities" => "card-account-details-outline",
@@ -193,27 +261,99 @@ fn schema(kind: &str) -> Value {
         "views" => "table-eye",
         _ => "connection",
     };
-    let fields:Map<String,Value>=fields(kind).into_iter().map(|(name,typ)|(name.into(),json!({"name":name,"label":crate::python_title(&name.replace('_'," ")),"type":typ,"read_only":true,"required":false,"nullable":true,"null":true,"many":false,"ui":true,"hidden":false,"deferred":false,"sortable":true,"filterable":typ!="json"}))).collect();
+    let fields:Map<String,Value>=fields(kind).into_iter().map(|(name,typ)|{
+        let write=writable(kind,name,actor);
+        let mut field=json!({"name":name,"label":crate::python_title(&name.replace('_'," ")),"type":typ,"read_only":!write,"required":name=="name" && write,"nullable":!write,"null":!write,"many":typ=="relation","ui":true,"hidden":false,"deferred":false,"sortable":filterable(kind,name),"filterable":filterable(kind,name)});
+        match (kind,name) {
+            ("users","roles")=>{
+                field["related_resource"]=json!("roles");
+                field["choices"]=json!(roles);
+                field["description"]=json!("The roles this user holds; each role's permissions apply.");
+            }
+            ("roles","permissions")=>{
+                field["description"]=json!("What this role may do, per resource and operation. A rule is allowed, denied, or a condition the records must meet.");
+                field["resources"]=access_resources(app);
+            }
+            _=>{}
+        }
+        (name.into(),field)
+    }).collect();
     let permissions: Map<String, Value> = fields
         .keys()
         .map(|name| {
+            let write = writable(kind, name, actor);
             (
                 name.clone(),
-                json!({"read":true,"create":false,"write":false}),
+                json!({"read":true,"create":write,"write":write}),
             )
         })
         .collect();
     let field_names: Vec<_> = fields.keys().cloned().collect();
-    json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":crate::python_title(&kind.replace('_'," ")),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":section(kind),"fields":fields,"permissions":{"list":true,"read":true,"create":false,"update":false,"delete":false,"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]})
+    let operations: Map<String, Value> = ["create", "update", "delete"]
+        .into_iter()
+        .map(|operation| {
+            let supported = matches!(
+                (kind, operation),
+                ("roles", "create" | "update" | "delete") | ("users", "update")
+            );
+            (
+                operation.into(),
+                json!(supported && actor.granted(kind, operation)),
+            )
+        })
+        .collect();
+    json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":crate::python_title(&kind.replace('_'," ")),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":section(kind),"fields":fields,"permissions":{"list":true,"read":true,"create":operations["create"],"update":operations["update"],"delete":operations["delete"],"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]})
 }
-async fn metadata(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
-    let actor = app.actor(&user(&app, &headers).await?);
+/// Built-in fields the list endpoint can filter and sort by.
+fn filterable(kind: &str, field: &str) -> bool {
+    !fields(kind)
+        .iter()
+        .any(|(name, typ)| *name == field && ["json", "list", "permissions"].contains(typ))
+}
+/// The resources an access map may name, for the permissions editor: their
+/// labels, and whether rules on them may carry conditions.
+fn access_resources(app: &App) -> Value {
     let mut resources: Map<String, Value> = KINDS
         .iter()
-        .map(|k| ((*k).to_string(), schema(k)))
+        .filter(|kind| !section(kind).is_empty())
+        .map(|kind| {
+            (
+                (*kind).to_string(),
+                json!({"label":crate::python_title(&kind.replace('_'," ")),"conditional":false}),
+            )
+        })
         .collect();
     for (name, model) in &app.registry.models {
-        if crate::operation_granted(&model.resource, Some(actor.principal()), "list", true) {
+        // Resources without grants are open to everyone; a rule adds nothing.
+        if model.resource.role_grants.is_empty() {
+            continue;
+        }
+        let label = model
+            .resource
+            .metadata
+            .as_ref()
+            .and_then(|m| m["label"].as_str())
+            .map_or_else(
+                || crate::python_title(&name.replace('_', " ")),
+                str::to_owned,
+            );
+        resources.insert(name.clone(), json!({"label":label,"conditional":true}));
+    }
+    Value::Object(resources)
+}
+async fn metadata(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let actor = app.actor(&user(&app, &headers).await?).await?;
+    let roles = role_choices(&app).await?;
+    let mut resources: Map<String, Value> = KINDS
+        .iter()
+        .map(|k| ((*k).to_string(), schema(&app, k, &actor, &roles)))
+        .collect();
+    for (name, model) in &app.registry.models {
+        let resource = app
+            .registry
+            .resource_for(name, &actor)
+            .unwrap_or_else(|| model.resource.clone());
+        if crate::operation_granted(&resource, Some(actor.principal()), "list", true) {
             resources.insert(
                 name.clone(),
                 extensions::metadata(model, &actor, &app.registry),
@@ -229,9 +369,13 @@ async fn options(
     headers: HeaderMap,
     Path(kind): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let actor = app.actor(&user(&app, &headers).await?);
+    let actor = app.actor(&user(&app, &headers).await?).await?;
     if let Some(model) = app.registry.models.get(&kind) {
-        if !crate::operation_granted(&model.resource, Some(actor.principal()), "list", true) {
+        let resource = app
+            .registry
+            .resource_for(&kind, &actor)
+            .unwrap_or_else(|| model.resource.clone());
+        if !crate::operation_granted(&resource, Some(actor.principal()), "list", true) {
             return Err(ApiError::Forbidden);
         }
         return Ok(Json(extensions::metadata(model, &actor, &app.registry)));
@@ -239,7 +383,12 @@ async fn options(
     if !KINDS.contains(&kind.as_str()) {
         return Err(ApiError::NotFound);
     }
-    Ok(Json(schema(&kind)))
+    Ok(Json(schema(
+        &app,
+        &kind,
+        &actor,
+        &role_choices(&app).await?,
+    )))
 }
 fn expression(query: &mut QueryBuilder<'_, Postgres>, field: &str) {
     if ["id", "created", "updated"].contains(&field) {
@@ -258,6 +407,7 @@ fn filters(
         .push_bind(kind.to_owned());
     for filter in &features.filters {
         if !fields(kind).iter().any(|(f, _)| *f == filter.field)
+            || !filterable(kind, &filter.field)
             || filter.field_reference
             || !filter.relation.is_empty()
             || !matches!(
@@ -340,7 +490,7 @@ async fn list(
     filters(&mut query, &kind, &features)?;
     query.push(" ORDER BY ");
     for sort in &features.sort {
-        if !fields(&kind).iter().any(|(f, _)| *f == sort.field) {
+        if !fields(&kind).iter().any(|(f, _)| *f == sort.field) || !filterable(&kind, &sort.field) {
             return Err(ApiError::Parse("Unknown sort field.".into()));
         }
         expression(&mut query, &sort.field);
@@ -427,17 +577,79 @@ async fn logout(State(app): State<App>, headers: HeaderMap) -> Result<Response, 
     );
     Ok(response)
 }
-async fn core_readonly(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    let core = request
-        .uri()
-        .path()
-        .strip_prefix("/api/admin/")
-        .and_then(|p| p.split('/').next())
-        .is_some_and(|kind| KINDS.contains(&kind));
-    if core && !matches!(request.method().as_str(), "GET" | "OPTIONS") {
-        return ApiError::MethodNotAllowed(request.method().to_string()).into_response();
+/// Writes to built-in resources: roles, and the roles users hold.
+async fn core_write(
+    app: &App,
+    headers: &HeaderMap,
+    kind: &str,
+    id: Option<Uuid>,
+    input: Value,
+    method: &str,
+) -> Result<Value, ApiError> {
+    let actor = app.actor(&user(app, headers).await?).await?;
+    let mut tx = app.pool.begin().await.map_err(ApiError::internal)?;
+    extensions::lock(&mut tx).await?;
+    let record = core::write(app, &mut tx, &actor, kind, id, input, method).await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(record)
+}
+/// Built-in resources answer 405 before any body is read, so an unsupported
+/// write never fails on its content type first.
+fn body(input: Option<Json<Value>>) -> Result<Json<Value>, ApiError> {
+    input.ok_or_else(|| ApiError::Parse("Expected a JSON body.".into()))
+}
+async fn create(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(kind): Path<String>,
+    input: Option<Json<Value>>,
+) -> Result<(StatusCode, Json<ApiDocument>), ApiError> {
+    if !KINDS.contains(&kind.as_str()) {
+        return extension_api::create(State(app), headers, Path(kind), body(input)?).await;
     }
-    next.run(request).await
+    let input = input.map_or(Value::Null, |Json(value)| value);
+    let record = core_write(&app, &headers, &kind, None, input, "POST").await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiDocument::one(singular(&kind), record)),
+    ))
+}
+async fn update(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path((kind, id)): Path<(String, Uuid)>,
+    input: Option<Json<Value>>,
+) -> Result<Json<ApiDocument>, ApiError> {
+    if !KINDS.contains(&kind.as_str()) {
+        return extension_api::update(State(app), headers, Path((kind, id)), body(input)?).await;
+    }
+    let input = input.map_or(Value::Null, |Json(value)| value);
+    let record = core_write(&app, &headers, &kind, Some(id), input, "PATCH").await?;
+    Ok(Json(ApiDocument::one(singular(&kind), record)))
+}
+async fn replace(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path((kind, id)): Path<(String, Uuid)>,
+    input: Option<Json<Value>>,
+) -> Result<Json<ApiDocument>, ApiError> {
+    if !KINDS.contains(&kind.as_str()) {
+        return extension_api::replace(State(app), headers, Path((kind, id)), body(input)?).await;
+    }
+    let input = input.map_or(Value::Null, |Json(value)| value);
+    let record = core_write(&app, &headers, &kind, Some(id), input, "PUT").await?;
+    Ok(Json(ApiDocument::one(singular(&kind), record)))
+}
+async fn delete(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path((kind, id)): Path<(String, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    if !KINDS.contains(&kind.as_str()) {
+        return extension_api::delete(State(app), headers, Path((kind, id))).await;
+    }
+    core_write(&app, &headers, &kind, Some(id), json!({}), "DELETE").await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 pub fn router(app: App) -> Router {
     let routes=Router::new().route("/health",get(|State(app):State<App>|async move{Json(json!({"status":"ok","service":"dreamy-app","name":app.name,"revision":app.revision}))}))
@@ -451,13 +663,11 @@ pub fn router(app: App) -> Router {
         .route("/auth/google",get(google_auth::start))
         .route("/auth/google/callback",get(google_auth::callback))
         .route("/admin/",get(metadata).options(metadata)).route("/admin/users/me/",get(me))
-        .route("/admin/{kind}/",get(list).options(options).post(extension_api::create))
-        .route("/admin/{kind}/{id}/",get(retrieve).patch(extension_api::update).put(extension_api::replace).delete(extension_api::delete))
+        .route("/admin/{kind}/",get(list).options(options).post(create))
+        .route("/admin/{kind}/{id}/",get(retrieve).patch(update).put(replace).delete(delete))
         .route("/admin/{kind}/{id}/actions/{action}/",axum::routing::post(extension_api::action))
         .route("/v0/s3/",get(s3)).with_state(app);
-    Router::new()
-        .nest("/api", routes)
-        .layer(axum::middleware::from_fn(core_readonly))
+    Router::new().nest("/api", routes)
 }
 /// Construct the core router from environment configuration.
 /// # Errors
