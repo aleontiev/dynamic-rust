@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, QueryBuilder, postgres::PgPoolOptions};
@@ -564,7 +565,55 @@ async fn s3(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>, A
     user(&app, &headers).await?;
     Ok(Json(json!({})))
 }
-async fn logout(State(app): State<App>, headers: HeaderMap) -> Result<Response, ApiError> {
+/// The page to return to after signing in: a path on this app, given either as
+/// a path or as an absolute URL on the app's origin, and never an API page.
+/// An admin ends a session with `/api/logout/?next=/api/login/?next=<page>`,
+/// so a login URL wrapping the page is unwrapped once.
+pub(crate) fn next_path(app: &App, value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || value.len() > 2000 {
+        return None;
+    }
+    let base = url::Url::parse(&format!("{}/", app.origin)).ok()?;
+    let url = base.join(value).ok()?;
+    if url.origin() != base.origin()
+        || url.path().starts_with("/api/") && url.path() != "/api/login/"
+    {
+        return None;
+    }
+    if url.path() == "/api/login/" {
+        let inner = url
+            .query_pairs()
+            .find(|(key, _)| key == "next")
+            .map(|(_, v)| v.into_owned());
+        return next_path(app, inner.as_deref());
+    }
+    let path = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_owned(),
+    };
+    (path.starts_with('/') && !path.starts_with("//")).then_some(path)
+}
+/// `/api/login/`, remembering the page to return to when there is one.
+pub(crate) fn login_url(app: &App, next: Option<&str>) -> String {
+    match next_path(app, next) {
+        Some(path) => format!(
+            "{}/api/login/?next={}",
+            app.origin,
+            url::form_urlencoded::byte_serialize(path.as_bytes()).collect::<String>()
+        ),
+        None => format!("{}/api/login/", app.origin),
+    }
+}
+#[derive(Deserialize)]
+struct Logout {
+    next: Option<String>,
+}
+async fn logout(
+    State(app): State<App>,
+    headers: HeaderMap,
+    axum::extract::Query(input): axum::extract::Query<Logout>,
+) -> Result<Response, ApiError> {
     for token in [
         cookie(&headers, "dream_preview"),
         cookie(&headers, "dream_app"),
@@ -578,7 +627,7 @@ async fn logout(State(app): State<App>, headers: HeaderMap) -> Result<Response, 
             .await
             .map_err(ApiError::internal)?;
     }
-    let mut response = redirect(&format!("{}/api/login/", app.origin), "dream_app", "", 0)?;
+    let mut response = redirect(&login_url(&app, input.next.as_deref()), "dream_app", "", 0)?;
     response.headers_mut().append(
         header::SET_COOKIE,
         "dream_preview=; Path=/api; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=0"

@@ -142,7 +142,10 @@ impl Fixture {
         }
     }
     async fn start(&self, app: &Router) -> (String, String, String) {
-        let (status, headers, _) = call(app, "/api/auth/google", None).await;
+        self.start_at(app, "/api/auth/google").await
+    }
+    async fn start_at(&self, app: &Router, path: &str) -> (String, String, String) {
+        let (status, headers, _) = call(app, path, None).await;
         assert_eq!(status, 303);
         assert!(
             headers["location"]
@@ -298,6 +301,24 @@ async fn google_sign_in_binds_state_pkce_identity_session_and_logout() {
     let (_, h, _) = call(&f.app, &callback(&state, &code), Some(&cookie)).await;
     failed(&h, "expired");
     assert_eq!(f.broker.lock().unwrap().exchanges, 1);
+    // A return page given when starting comes back with the session; anything off this app does not.
+    for (next, location) in [
+        (
+            "%2Forders%2F%3Fpage%3D2",
+            "https://app.example.org/orders/?page=2",
+        ),
+        (
+            "https%3A%2F%2Fevil.example.org%2F",
+            "https://app.example.org",
+        ),
+    ] {
+        let (state, code, cookie) = f
+            .start_at(&f.app, &format!("/api/auth/google?next={next}"))
+            .await;
+        let (status, h, _) = call(&f.app, &callback(&state, &code), Some(&cookie)).await;
+        assert_eq!(status, 303);
+        assert_eq!(h["location"], location, "{next}");
+    }
     let (_, h, _) = call(&f.app, "/api/logout/", Some(&session)).await;
     assert_eq!(h["location"], "https://app.example.org/api/login/");
     assert_eq!(

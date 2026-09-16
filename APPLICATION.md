@@ -74,6 +74,11 @@ step with the registered models; its name is fixed. A superuser who signs in
 holds it, so the owner's own record shows and carries full access from the
 first sign-in. Make other roles for narrower access.
 
+Signing out with `/api/logout/?next=<page>` sends the browser to `/api/login/`
+remembering that page — a path on this app, an absolute URL on its origin, or
+the login URL an admin wraps it in — and the sign-in that follows, by email
+link or Google, returns there. Pages elsewhere and API pages are ignored.
+
 Relations appear in metadata as `one`/`many` fields with `related` naming the
 resource when the actor may list it, and as plain `uuid` fields otherwise.
 `include[]=<relation>.*` on a list or detail request sideloads the related

@@ -41,3 +41,4 @@ CREATE TABLE IF NOT EXISTS app_google_states (
     expires timestamptz NOT NULL
 );
 CREATE INDEX IF NOT EXISTS app_google_states_expires ON app_google_states(expires);
+ALTER TABLE app_google_states ADD COLUMN IF NOT EXISTS next text;

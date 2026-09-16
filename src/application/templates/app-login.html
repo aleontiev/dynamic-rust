@@ -26,8 +26,12 @@
 (() => {
   const form=document.getElementById('email-form'),confirmForm=document.getElementById('confirm-form'),notice=document.getElementById('notice'),again=document.getElementById('again');
   const googleError=new URLSearchParams(location.search).get('google_error');
+  // The page to return to after signing in: a path on this app, never an API page.
+  const requested=new URLSearchParams(location.search).get('next')||'';
+  const next=/^\/(?!\/|api\/)/.test(requested)?requested:'/';
   let token=new URLSearchParams(location.hash.slice(1)).get('token');
-  if(location.hash||googleError) history.replaceState(null,'',location.pathname);
+  if(location.hash||googleError) history.replaceState(null,'',location.pathname+(next!=='/'?'?next='+encodeURIComponent(next):''));
+  const google=document.querySelector('.google');if(google&&next!=='/')google.href='/api/auth/google?next='+encodeURIComponent(next);
   function message(text,error=false){notice.textContent=text;notice.classList.toggle('error',error);notice.hidden=false;}
   const embedded=window.top!==window;
   if(embedded)document.querySelector('.google')?.addEventListener('click',event=>{event.preventDefault();if(!window.dreamPreviewAuthenticate('google'))message('Allow the sign-in window to open, then try again.',true);});
@@ -35,8 +39,8 @@
   function reset(){token=null;confirmForm.hidden=true;form.hidden=false;again.hidden=true;notice.hidden=true;document.getElementById('heading').textContent=document.title;document.getElementById('intro').textContent="Enter your email and we'll send you a secure sign-in link.";document.getElementById('email').focus();}
   if(token){form.hidden=true;confirmForm.hidden=false;document.getElementById('intro').textContent='Select Confirm sign in to use this email link. Opening this page does not sign you in.';again.hidden=false;}
   async function post(path,body){const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'});let result={};try{result=await response.json();}catch{}return {response,result};}
-  form.addEventListener('submit',async(event)=>{event.preventDefault();if(embedded){if(!window.dreamPreviewAuthenticate('email',document.getElementById('email').value))message('Allow the sign-in window to open, then try again.',true);return;}const button=document.getElementById('send');button.disabled=true;notice.hidden=true;try{const {response,result}=await post('/api/auth/magic-link',{email:document.getElementById('email').value});if(response.ok){form.hidden=true;again.hidden=false;message('Check your inbox. Follow the sign-in link in your email to continue.');}else{message(result.detail||'We could not send a link. Please try again.',true);}}catch{message('Could not connect. Please try again.',true);}finally{button.disabled=false;}});
-  confirmForm.addEventListener('submit',async(event)=>{event.preventDefault();const button=document.getElementById('confirm');button.disabled=true;try{const {response}=await post('/api/auth/verify',{token});if(response.ok){token=null;location.assign('/');}else if(response.status===401){token=null;confirmForm.hidden=true;again.hidden=false;message('This link has expired or has already been used. Request a new link to sign in.',true);}else{message('Could not sign in. Please try again.',true);}}catch{message('Could not connect. Please try again.',true);}finally{button.disabled=false;}});
+  form.addEventListener('submit',async(event)=>{event.preventDefault();if(embedded){if(!window.dreamPreviewAuthenticate('email',document.getElementById('email').value))message('Allow the sign-in window to open, then try again.',true);return;}const button=document.getElementById('send');button.disabled=true;notice.hidden=true;try{const {response,result}=await post('/api/auth/magic-link',next!=='/'?{email:document.getElementById('email').value,next}:{email:document.getElementById('email').value});if(response.ok){form.hidden=true;again.hidden=false;message('Check your inbox. Follow the sign-in link in your email to continue.');}else{message(result.detail||'We could not send a link. Please try again.',true);}}catch{message('Could not connect. Please try again.',true);}finally{button.disabled=false;}});
+  confirmForm.addEventListener('submit',async(event)=>{event.preventDefault();const button=document.getElementById('confirm');button.disabled=true;try{const {response}=await post('/api/auth/verify',{token});if(response.ok){token=null;location.assign(next);}else if(response.status===401){token=null;confirmForm.hidden=true;again.hidden=false;message('This link has expired or has already been used. Request a new link to sign in.',true);}else{message('Could not sign in. Please try again.',true);}}catch{message('Could not connect. Please try again.',true);}finally{button.disabled=false;}});
   again.addEventListener('click',reset);
   (() => {
     const branding=window.__DREAM_BRANDING__;

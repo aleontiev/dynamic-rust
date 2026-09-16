@@ -134,18 +134,26 @@ struct Authorization {
     authorization_url: String,
 }
 
-pub(super) async fn start(State(app): State<App>) -> Result<Response, ApiError> {
+#[derive(Deserialize)]
+pub(super) struct Start {
+    next: Option<String>,
+}
+pub(super) async fn start(
+    State(app): State<App>,
+    Query(input): Query<Start>,
+) -> Result<Response, ApiError> {
     let Some(auth) = &app.google_auth else {
         return failure(&app, "unavailable");
     };
     let state = random();
     let verifier = random();
+    let next = super::next_path(&app, input.next.as_deref());
     sqlx::query("DELETE FROM app_google_states WHERE expires<now()")
         .execute(&app.pool)
         .await
         .map_err(ApiError::internal)?;
-    sqlx::query("INSERT INTO app_google_states(digest,verifier,client_id,expires) VALUES($1,$2,$3,now()+interval '10 minutes')")
-        .bind(hash(&state)).bind(&verifier).bind(&auth.client_id)
+    sqlx::query("INSERT INTO app_google_states(digest,verifier,client_id,expires,next) VALUES($1,$2,$3,now()+interval '10 minutes',$4)")
+        .bind(hash(&state)).bind(&verifier).bind(&auth.client_id).bind(&next)
         .execute(&app.pool).await.map_err(ApiError::internal)?;
     let result: Result<Authorization, ()> = broker(auth, "/v1/requests", json!({
         "client_id":auth.client_id,"client_secret":auth.client_secret,
@@ -208,10 +216,10 @@ pub(super) async fn callback(
         return failure(&app, "expired");
     }
     // Commit consumption before any network request. A failed exchange is never retried.
-    let verifier: Option<String> = sqlx::query_scalar(
-        "DELETE FROM app_google_states WHERE digest=$1 AND client_id=$2 AND expires>now() RETURNING verifier"
+    let consumed: Option<(String, Option<String>)> = sqlx::query_as(
+        "DELETE FROM app_google_states WHERE digest=$1 AND client_id=$2 AND expires>now() RETURNING verifier,next"
     ).bind(hash(state)).bind(&auth.client_id).fetch_optional(&app.pool).await.map_err(ApiError::internal)?;
-    let Some(verifier) = verifier else {
+    let Some((verifier, next)) = consumed else {
         return failure(&app, "expired");
     };
     if input.error.is_some() {
@@ -321,7 +329,11 @@ pub(super) async fn callback(
     .await
     .map_err(ApiError::internal)?;
     tx.commit().await.map_err(ApiError::internal)?;
-    let mut response = redirect(&app.origin, "dream_app", &session, 43200)?;
+    let destination = match super::next_path(&app, next.as_deref()) {
+        Some(path) => format!("{}{path}", app.origin),
+        None => app.origin.clone(),
+    };
+    let mut response = redirect(&destination, "dream_app", &session, 43200)?;
     response.headers_mut().append(
         header::SET_COOKIE,
         "dream_google=; Path=/api; HttpOnly; Secure; SameSite=Lax; Max-Age=0"

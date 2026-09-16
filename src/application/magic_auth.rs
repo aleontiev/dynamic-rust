@@ -190,6 +190,8 @@ fn json_response(status: StatusCode, body: Value) -> Response {
 #[serde(deny_unknown_fields)]
 pub(super) struct RequestLink {
     email: String,
+    /// The page to return to after confirming, carried in the emailed link.
+    next: Option<String>,
 }
 pub(super) async fn request_link(
     State(app): State<App>,
@@ -232,7 +234,10 @@ pub(super) async fn request_link(
         .map_err(ApiError::internal)?;
     sqlx::query("INSERT INTO app_magic_links(digest,email,expires) VALUES($1,$2,now()+interval '15 minutes')").bind(&token_digest).bind(&email).execute(&mut *tx).await.map_err(ApiError::internal)?;
     tx.commit().await.map_err(ApiError::internal)?;
-    let link = format!("{}/api/login/#token={token}", app.origin);
+    let link = format!(
+        "{}#token={token}",
+        super::login_url(&app, input.next.as_deref())
+    );
     if let Err(error) = send(&app, &email, &link).await {
         let _ = sqlx::query("DELETE FROM app_magic_links WHERE digest=$1")
             .bind(&token_digest)

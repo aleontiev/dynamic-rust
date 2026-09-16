@@ -202,6 +202,9 @@ async fn post(
     let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
     (status, headers, serde_json::from_slice(&bytes).unwrap())
 }
+fn urlencoding(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
 fn mail_token(f: &Fixture) -> String {
     let mail = f.mail.lock().unwrap();
     let link = mail.last().unwrap()["text"]
@@ -375,6 +378,40 @@ async fn magic_link_delivery_confirmation_replay_and_logout() {
     let (status, headers, _) = call(&f.app, "GET", "/api/logout/", Some(cookie)).await;
     assert_eq!(status, 303);
     assert_eq!(headers["location"], "https://dummy.example.org/api/login/");
+    // Signing out remembers a page on this app to return to, given as a path, an
+    // absolute URL, or the login URL an admin wraps it in; never elsewhere or an API page.
+    for (next, expected) in [
+        (
+            "/users/?page=2",
+            "https://dummy.example.org/api/login/?next=%2Fusers%2F%3Fpage%3D2",
+        ),
+        (
+            "https://dummy.example.org/orders/",
+            "https://dummy.example.org/api/login/?next=%2Forders%2F",
+        ),
+        (
+            "/api/login/?next=https%3A%2F%2Fdummy.example.org%2Froles%2F",
+            "https://dummy.example.org/api/login/?next=%2Froles%2F",
+        ),
+        (
+            "https://evil.example.org/users/",
+            "https://dummy.example.org/api/login/",
+        ),
+        (
+            "//evil.example.org/",
+            "https://dummy.example.org/api/login/",
+        ),
+        ("/api/admin/users/", "https://dummy.example.org/api/login/"),
+    ] {
+        let (_, headers, _) = call(
+            &f.app,
+            "GET",
+            &format!("/api/logout/?next={}", urlencoding(next)),
+            None,
+        )
+        .await;
+        assert_eq!(headers["location"].to_str().unwrap(), expected, "{next}");
+    }
     assert!(
         headers["set-cookie"]
             .to_str()
@@ -448,6 +485,45 @@ async fn magic_link_expiry_failure_and_existing_user() {
         202
     );
     let token = mail_token(&f);
+    // A requested return page rides in the emailed link, before the token.
+    assert_eq!(
+        post(
+            &f.app,
+            "/api/auth/magic-link",
+            json!({"email":"expired@example.org","next":"/orders/?state=draft"}),
+            None
+        )
+        .await
+        .0,
+        202
+    );
+    let link = f.mail.lock().unwrap().last().unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        link.contains(
+            "https://dummy.example.org/api/login/?next=%2Forders%2F%3Fstate%3Ddraft#token="
+        ),
+        "{link}"
+    );
+    assert_eq!(
+        post(
+            &f.app,
+            "/api/auth/magic-link",
+            json!({"email":"expired@example.org","next":"https://evil.example.org/"}),
+            None
+        )
+        .await
+        .0,
+        202
+    );
+    assert!(
+        f.mail.lock().unwrap().last().unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("https://dummy.example.org/api/login/#token=")
+    );
     sqlx::query("UPDATE app_magic_links SET expires=now()-interval '1 second'")
         .execute(&f.pool)
         .await
