@@ -28,15 +28,101 @@ pub(super) async fn list(
         .map_err(ApiError::internal)?;
     let mut ctx = Context::new(&mut tx, &app.registry, actor);
     let (mut rows, total) = ctx.list(&kind, &features).await?;
+    let mut document = ApiDocument::many(
+        kind.clone(),
+        vec![],
+        PageMeta::new(features.page, features.per_page, total),
+    );
+    sideload(&mut ctx, &kind, &rows, &features, &mut document).await?;
     for row in &mut rows {
         project(row, &features);
     }
+    document.resources.insert(kind, Value::Array(rows));
     tx.commit().await.map_err(ApiError::internal)?;
-    Ok(Json(ApiDocument::many(
-        kind,
-        rows,
-        PageMeta::new(features.page, features.per_page, total),
-    )))
+    Ok(Json(document))
+}
+/// Sideload the related records a request asks for (`include[]=supplier.*`, as
+/// the admin does for every relation it shows), keyed by the related resource,
+/// so names can be shown instead of ids. Relations the actor may not read are
+/// left out rather than failing the request.
+async fn sideload(
+    ctx: &mut Context<'_>,
+    kind: &str,
+    rows: &[Value],
+    features: &QueryFeatures,
+    document: &mut ApiDocument,
+) -> Result<(), ApiError> {
+    let relations: Vec<(String, String)> = ctx
+        .registry
+        .models
+        .get(kind)
+        .map(|model| {
+            model
+                .resource
+                .fields
+                .iter()
+                .filter_map(|field| {
+                    field
+                        .related_resource
+                        .clone()
+                        .map(|related| (field.name.clone(), related))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for (field, related) in relations {
+        let wanted = features.include.iter().any(|include| {
+            include == &field || include == &format!("{field}.*") || include == &format!("{field}.")
+        });
+        if !wanted || related == kind {
+            continue;
+        }
+        let ids: std::collections::BTreeSet<String> = rows
+            .iter()
+            .flat_map(|row| match &row[&field] {
+                Value::String(id) => vec![id.clone()],
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect(),
+                _ => vec![],
+            })
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let query = ids
+            .iter()
+            .map(|id| format!("filter{{id.in}}={id}"))
+            .chain(std::iter::once(format!("per_page={}", ids.len())))
+            .collect::<Vec<_>>()
+            .join("&");
+        let page = u32::try_from(ids.len()).unwrap_or(u32::MAX).max(1);
+        let records = match ctx
+            .list(&related, &QueryFeatures::parse(&query, page)?)
+            .await
+        {
+            Ok((records, _)) => records,
+            Err(ApiError::Forbidden) => continue,
+            Err(error) => return Err(error),
+        };
+        let entry = document
+            .resources
+            .entry(related)
+            .or_insert_with(|| Value::Array(vec![]));
+        if let Some(existing) = entry.as_array_mut() {
+            let known: std::collections::BTreeSet<String> = existing
+                .iter()
+                .filter_map(|record| record["id"].as_str().map(str::to_owned))
+                .collect();
+            existing.extend(
+                records
+                    .into_iter()
+                    .filter(|record| !record["id"].as_str().is_some_and(|id| known.contains(id))),
+            );
+        }
+    }
+    Ok(())
 }
 pub(super) async fn retrieve(
     app: App,
@@ -49,14 +135,21 @@ pub(super) async fn retrieve(
     let mut conn = app.pool.acquire().await.map_err(ApiError::internal)?;
     let mut ctx = Context::new(&mut conn, &app.registry, actor);
     let mut row = ctx.get(&kind, id).await?;
-    project(
-        &mut row,
-        &QueryFeatures::parse(query_string.as_deref().unwrap_or(""), 1000)?,
-    );
-    Ok(Json(ApiDocument::one(
-        &app.registry.models[&kind].resource.name,
-        row,
-    )))
+    let features = QueryFeatures::parse(query_string.as_deref().unwrap_or(""), 1000)?;
+    let mut document = ApiDocument::one(&app.registry.models[&kind].resource.name, Value::Null);
+    sideload(
+        &mut ctx,
+        &kind,
+        std::slice::from_ref(&row),
+        &features,
+        &mut document,
+    )
+    .await?;
+    project(&mut row, &features);
+    document
+        .resources
+        .insert(app.registry.models[&kind].resource.name.clone(), row);
+    Ok(Json(document))
 }
 fn project(row: &mut Value, features: &QueryFeatures) {
     row.as_object_mut().unwrap().retain(|name, _| {

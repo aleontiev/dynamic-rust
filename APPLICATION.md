@@ -62,10 +62,23 @@ saved; `OPTIONS /api/admin/roles/` lists the resources rules may name under the
 
 Superusers, and holders of a role whose map grants those operations on `roles`
 and `users`, create, edit and delete roles and set the `roles` (and `name`) of
-users; deleting a role removes it from every user. Everything else built in
+users; deleting a role removes it from every user. `dashboards` and `views`
+(the admin's saved pages) are written the same way. Everything else built in
 remains read-only. Role names must be unique; `*` and `authenticated` are
 reserved. Role entries on a user that are not record ids are still treated as
 role names, so applications that assigned roles by name keep working.
+
+`registry.migrate` provisions a managed **Admin** role granting every
+operation on every resource (users: list, read, update) and keeps its map in
+step with the registered models; its name is fixed. A superuser who signs in
+holds it, so the owner's own record shows and carries full access from the
+first sign-in. Make other roles for narrower access.
+
+Relations appear in metadata as `one`/`many` fields with `related` naming the
+resource when the actor may list it, and as plain `uuid` fields otherwise.
+`include[]=<relation>.*` on a list or detail request sideloads the related
+records under the related resource's name (only those the actor may read), so
+an admin can show names instead of ids.
 
 `.label(field, text)` and `.describe(field, text)` set the heading and help text
 the admin shows for a field; without a label it title-cases the field name, and

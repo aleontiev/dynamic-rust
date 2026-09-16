@@ -444,6 +444,7 @@ pub(super) async fn verify(
             .await
             .map_err(ApiError::internal)?;
     }
+    super::core::admit_superuser(&app, &mut tx, id, &email).await?;
     let subject = format!("email:{email}");
     let identity: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM app_records WHERE kind='identities' AND data->>'provider'='email_magic_link' AND data->>'subject'=$1)",

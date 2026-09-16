@@ -418,6 +418,7 @@ impl Registry {
             .execute(&mut *tx)
             .await
             .map_err(ApiError::internal)?;
+        super::core::ensure_admin_role(&mut tx, self.models.keys().cloned()).await?;
         for (name, sql) in &self.migrations {
             let digest = super::hash(sql);
             let prior: Option<String> =
@@ -1074,8 +1075,12 @@ pub fn metadata(model: &Model, actor: &Actor, registry: &Registry) -> Value {
         .resource_for(&model.resource.plural_name, actor)
         .unwrap_or_else(|| model.resource.clone());
     let fields: Map<String,Value>=resource.fields.iter().map(|f| {
-        let typ=match f.kind {FieldKind::DateTime=>json!("datetime"), _=>serde_json::to_value(&f.kind).unwrap_or(Value::Null)};
-        (f.name.clone(),json!({"name":f.name,"label":f.label.clone().unwrap_or_else(||crate::python_title(&f.name.replace('_'," "))),"description":f.description,"type":typ,"read_only":f.read_only,"required":f.required,"nullable":f.nullable,"null":f.nullable,"many":f.many,"ui":true,"hidden":f.write_only,"deferred":f.deferred,"sortable":!f.write_only,"filterable":!f.write_only,"related_resource":f.related_resource}))
+        // A relation is one the admin can follow only when the actor may list the
+        // related resource; otherwise the field is just the id it holds.
+        let visible=f.related_resource.as_deref().and_then(|related| registry.resource_for(related, actor)).is_some_and(|related| crate::operation_granted(&related, Some(actor.principal()), "list", true));
+        let typ=match f.kind {FieldKind::DateTime=>json!("datetime"), FieldKind::Relation if visible=>json!(if f.many {"many"} else {"one"}), FieldKind::Relation=>json!("uuid"), _=>serde_json::to_value(&f.kind).unwrap_or(Value::Null)};
+        let related=f.related_resource.clone().filter(|_| visible);
+        (f.name.clone(),json!({"name":f.name,"label":f.label.clone().unwrap_or_else(||crate::python_title(&f.name.replace('_'," "))),"description":f.description,"type":typ,"read_only":f.read_only,"required":f.required,"nullable":f.nullable,"null":f.nullable,"many":f.many,"ui":true,"hidden":f.write_only,"deferred":f.deferred,"sortable":!f.write_only,"filterable":!f.write_only,"related":related,"related_resource":f.related_resource}))
     }).collect();
     let names: Vec<_> = resource
         .fields

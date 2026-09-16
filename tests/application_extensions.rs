@@ -708,6 +708,35 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         "dream_app=auditor-token",
     );
 
+    // Migrating provisioned the managed Admin role with every operation on every
+    // resource, and it follows the registered models.
+    let (_, roles) = request(&app, "GET", "/api/admin/roles/", owner_cookie, Value::Null).await;
+    let admin_role = roles["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Admin")
+        .cloned()
+        .expect("managed Admin role");
+    assert_eq!(admin_role["permissions"]["orders"]["delete"], true);
+    assert_eq!(admin_role["permissions"]["roles"]["create"], true);
+    assert_eq!(admin_role["permissions"]["dashboards"]["create"], true);
+    assert_eq!(
+        admin_role["permissions"]["users"],
+        json!({"list":true,"read":true,"update":true})
+    );
+    // Relations are described the way the admin renders them: as one/many with the related resource.
+    let (_, meta) = request(
+        &app,
+        "OPTIONS",
+        "/api/admin/orders/",
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(meta["fields"]["supplier"]["type"], "one");
+    assert_eq!(meta["fields"]["supplier"]["related"], "suppliers");
+
     // The permissions field tells an editor which resources rules may name and
     // which of them accept conditions; built-ins take only true or false.
     let (_, meta) = request(
@@ -1162,7 +1191,7 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
     );
 
     // A role that manages roles and users delegates administration.
-    let (status, admins) = request(&app, "POST", "/api/admin/roles/", owner_cookie, json!({"name":"Admin","permissions":{"roles":{"list":true,"read":true,"create":true,"update":true,"delete":true},"users":{"list":true,"read":true,"update":true}}})).await;
+    let (status, admins) = request(&app, "POST", "/api/admin/roles/", owner_cookie, json!({"name":"Manager","permissions":{"roles":{"list":true,"read":true,"create":true,"update":true,"delete":true},"users":{"list":true,"read":true,"update":true}}})).await;
     assert_eq!(status, 201, "{admins}");
     let admins = admins["role"]["id"].as_str().unwrap().to_owned();
     assert_eq!(
@@ -1186,7 +1215,7 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
     );
     assert_eq!(
         meta["resources"]["users"]["fields"]["roles"]["choices"],
-        json!([{"id":admins,"label":"Admin"},{"id":role,"label":"Clerk"}]),
+        json!([{"id":admin_role["id"],"label":"Admin"},{"id":role,"label":"Clerk"},{"id":admins,"label":"Manager"}]),
         "existing roles are the choices for a user's roles"
     );
     assert_eq!(
@@ -1297,7 +1326,139 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         404
     );
 
+    // Dashboards and saved views are written by superusers and holders of roles that grant them.
+    let (status, dashboard) = request(
+        &app,
+        "POST",
+        "/api/admin/dashboards/",
+        owner_cookie,
+        json!({"name":"Operations","data":{"cards":[]}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{dashboard}");
+    let dashboard = dashboard["dashboard"]["id"].as_str().unwrap().to_owned();
+    let (status, view) = request(&app, "POST", "/api/admin/views/", owner_cookie, json!({"view":{"name":"Open orders","resource":"orders","data":{"filter":[{"state":"draft"}]}}})).await;
+    assert_eq!(status, 201, "{view}");
+    assert_eq!(view["view"]["resource"], "orders");
+    let (status, error) = request(
+        &app,
+        "POST",
+        "/api/admin/views/",
+        owner_cookie,
+        json!({"name":"Bad","resource":"rockets","data":{}}),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(
+        error["detail"]["resource"][0]
+            .as_str()
+            .unwrap()
+            .contains("Choose one of")
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/dashboards/{dashboard}/"),
+            owner_cookie,
+            json!({"name":"Ops"})
+        )
+        .await
+        .1["dashboard"]["name"],
+        "Ops"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/admin/dashboards/",
+            clerk_cookie,
+            json!({"name":"Mine","data":{}})
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("/api/admin/dashboards/{dashboard}/"),
+            owner_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        204
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &format!("/api/admin/dashboards/{dashboard}/"),
+            owner_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        404
+    );
+
+    // Related records are sideloaded on request, as the admin asks for every relation it shows.
+    let (_, listed) = request(
+        &app,
+        "GET",
+        "/api/admin/orders/?include[]=supplier.*",
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        listed["suppliers"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+    assert_eq!(listed["suppliers"][0]["name"], "Acme");
+    assert_eq!(
+        listed["orders"][0]["supplier"], supplier,
+        "the relation stays an id on the record"
+    );
+    let (_, plain) = request(&app, "GET", "/api/admin/orders/", owner_cookie, Value::Null).await;
+    assert!(
+        plain["suppliers"].is_null(),
+        "nothing is sideloaded unless asked"
+    );
+    let (_, one) = request(
+        &app,
+        "GET",
+        &format!("/api/admin/orders/{order}/?include[]=supplier.*"),
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(one["suppliers"][0]["name"], "Acme");
+
     // Legacy role names on a user still match the grants declared in code.
+    sqlx::query(
+        "UPDATE app_records SET data=jsonb_set(data,'{data,roles}','[\"viewer\"]') WHERE id=$1",
+    )
+    .bind(clerk)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, viewer_orders) = request(
+        &app,
+        "GET",
+        "/api/admin/orders/?include[]=supplier.*",
+        clerk_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{viewer_orders}");
+    assert!(
+        viewer_orders["suppliers"].is_null(),
+        "a viewer cannot read suppliers, so none are sideloaded"
+    );
     sqlx::query(
         "UPDATE app_records SET data=jsonb_set(data,'{data,roles}','[\"buyer\"]') WHERE id=$1",
     )

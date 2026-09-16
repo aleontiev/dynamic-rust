@@ -235,8 +235,21 @@ fn writable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
     match (kind, field) {
         ("roles", "name" | "permissions") => actor.granted("roles", "update"),
         ("users", "name" | "roles") => actor.granted("users", "update"),
+        ("dashboards", "name" | "data") | ("views", "name" | "resource" | "data") => {
+            actor.granted(kind, "update")
+        }
         _ => false,
     }
+}
+/// The write operations the API supports on a built-in resource.
+pub(crate) fn core_supports(kind: &str, operation: &str) -> bool {
+    matches!(
+        (kind, operation),
+        (
+            "roles" | "dashboards" | "views",
+            "create" | "update" | "delete"
+        ) | ("users", "update")
+    )
 }
 /// The roles that exist, as choices for a user's `roles` field.
 async fn role_choices(app: &App) -> Result<Vec<Value>, ApiError> {
@@ -292,10 +305,7 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
     let operations: Map<String, Value> = ["create", "update", "delete"]
         .into_iter()
         .map(|operation| {
-            let supported = matches!(
-                (kind, operation),
-                ("roles", "create" | "update" | "delete") | ("users", "update")
-            );
+            let supported = core_supports(kind, operation);
             (
                 operation.into(),
                 json!(supported && actor.granted(kind, operation)),
@@ -315,7 +325,7 @@ fn filterable(kind: &str, field: &str) -> bool {
 fn access_resources(app: &App) -> Value {
     let mut resources: Map<String, Value> = KINDS
         .iter()
-        .filter(|kind| !section(kind).is_empty())
+        .filter(|kind| !matches!(**kind, "identities" | "identity_verifications"))
         .map(|kind| {
             (
                 (*kind).to_string(),

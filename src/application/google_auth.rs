@@ -306,6 +306,7 @@ pub(super) async fn callback(
         }
         id
     };
+    super::core::admit_superuser(&app, &mut tx, id, &email).await?;
     let session = random();
     sqlx::query("DELETE FROM app_sessions WHERE expires<now()")
         .execute(&mut *tx)

@@ -21,6 +21,7 @@ fn invalid(field: &str, message: &str) -> ApiError {
 /// # Errors
 /// Rejects unsupported kinds and operations with 405, missing grants with
 /// 403, and malformed input with field errors.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn write(
     app: &App,
     connection: &mut PgConnection,
@@ -35,10 +36,7 @@ pub(super) async fn write(
         "PATCH" | "PUT" => "update",
         _ => "delete",
     };
-    if !matches!(
-        (kind, operation),
-        ("roles", "create" | "update" | "delete") | ("users", "update")
-    ) {
+    if !super::core_supports(kind, operation) {
         return Err(ApiError::MethodNotAllowed(method.to_owned()));
     }
     if !actor.granted(kind, operation) {
@@ -78,6 +76,42 @@ pub(super) async fn write(
             .await
             .map_err(ApiError::internal)?;
             fetch(connection, kind, id).await?
+        }
+        ("dashboards" | "views", "create") => {
+            let id = Uuid::new_v4();
+            let data = page_data(app, kind, &json!({"data":{}}), &input)?;
+            sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,$2,$3)")
+                .bind(id)
+                .bind(kind)
+                .bind(&data)
+                .execute(&mut *connection)
+                .await
+                .map_err(ApiError::internal)?;
+            fetch(connection, kind, id).await?
+        }
+        ("dashboards" | "views", "update") => {
+            let id = id.ok_or(ApiError::NotFound)?;
+            let current = raw(connection, kind, id).await?;
+            let data = page_data(app, kind, &current, &input)?;
+            sqlx::query("UPDATE app_records SET data=$3,updated=now() WHERE kind=$2 AND id=$1")
+                .bind(id)
+                .bind(kind)
+                .bind(&data)
+                .execute(&mut *connection)
+                .await
+                .map_err(ApiError::internal)?;
+            fetch(connection, kind, id).await?
+        }
+        ("dashboards" | "views", "delete") => {
+            let id = id.ok_or(ApiError::NotFound)?;
+            let current = fetch(connection, kind, id).await?;
+            sqlx::query("DELETE FROM app_records WHERE kind=$2 AND id=$1")
+                .bind(id)
+                .bind(kind)
+                .execute(&mut *connection)
+                .await
+                .map_err(ApiError::internal)?;
+            current
         }
         ("roles", "delete") => {
             let id = id.ok_or(ApiError::NotFound)?;
@@ -173,7 +207,109 @@ async fn role_data(
         .unwrap_or_else(|| json!({}));
     crate::parse_access_map(&permissions, &app.access_targets())
         .map_err(|message| invalid("permissions", &message))?;
-    Ok(json!({"name":name,"permissions":permissions}))
+    let mut record = json!({"name":name,"permissions":permissions});
+    for key in ["managed", "description"] {
+        if let Some(value) = current.get(key) {
+            record[key] = value.clone();
+        }
+    }
+    Ok(record)
+}
+
+/// The stored form of a dashboard or a saved view: a name, free-form `data`
+/// the admin owns, and for views the resource they belong to.
+fn page_data(app: &App, kind: &str, current: &Value, input: &Value) -> Result<Value, ApiError> {
+    let name = input
+        .get("name")
+        .or_else(|| current.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && n.chars().count() <= 200)
+        .ok_or_else(|| invalid("name", "Name must be 1 to 200 characters."))?;
+    let data = input
+        .get("data")
+        .or_else(|| current.get("data"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !data.is_object() || data.to_string().len() > 64_000 {
+        return Err(invalid("data", "Data must be an object up to 64 KB."));
+    }
+    let mut record = json!({"name":name,"data":data});
+    if kind == "views" {
+        let resource = input
+            .get("resource")
+            .or_else(|| current.get("resource"))
+            .and_then(Value::as_str)
+            .filter(|r| super::KINDS.contains(r) || app.registry.models.contains_key(*r))
+            .ok_or_else(|| invalid("resource", "Choose one of this app's resources."))?;
+        record["resource"] = json!(resource);
+    }
+    Ok(record)
+}
+
+/// Every operation on every resource: what the managed Admin role grants.
+pub(crate) fn admin_access_map(app_models: impl Iterator<Item = String>) -> Value {
+    let all = json!({"list":true,"read":true,"create":true,"update":true,"delete":true});
+    let mut map = serde_json::Map::new();
+    for kind in super::KINDS {
+        map.insert(
+            kind.into(),
+            match kind {
+                "roles" | "dashboards" | "views" => all.clone(),
+                "users" => json!({"list":true,"read":true,"update":true}),
+                _ => json!({"list":true,"read":true}),
+            },
+        );
+    }
+    for model in app_models {
+        map.insert(model, all.clone());
+    }
+    Value::Object(map)
+}
+
+/// The Admin role that grants everything, created on first use and kept in step
+/// with the registered models. The name is fixed; other roles are the owner's.
+pub async fn ensure_admin_role(
+    connection: &mut PgConnection,
+    models: impl Iterator<Item = String>,
+) -> Result<Uuid, ApiError> {
+    let permissions = admin_access_map(models);
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM app_records WHERE kind='roles' AND lower(data->>'name')='admin' ORDER BY created,id LIMIT 1",
+    )
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(ApiError::internal)?;
+    let id = existing.unwrap_or_else(Uuid::new_v4);
+    sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'roles',$2) ON CONFLICT(id) DO UPDATE SET data=jsonb_set(app_records.data,'{permissions}',$3),updated=now() WHERE app_records.data->'permissions' IS DISTINCT FROM $3")
+        .bind(id)
+        .bind(json!({"name":"Admin","permissions":permissions,"managed":true,"description":"Full access to every resource. Managed by the app; make other roles for narrower access."}))
+        .bind(&permissions)
+        .execute(&mut *connection)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(id)
+}
+
+/// Give a signing-in superuser the Admin role, so the owner's own record shows
+/// and carries the access the platform already guarantees them.
+pub(crate) async fn admit_superuser(
+    app: &App,
+    connection: &mut PgConnection,
+    user: Uuid,
+    email: &str,
+) -> Result<(), ApiError> {
+    if !app.superusers.contains(&email.trim().to_ascii_lowercase()) {
+        return Ok(());
+    }
+    let admin = ensure_admin_role(connection, app.registry.models.keys().cloned()).await?;
+    sqlx::query("UPDATE app_records SET data=jsonb_set(data,'{data,roles}',coalesce(data->'data'->'roles','[]'::jsonb)||to_jsonb($2::text)),updated=now() WHERE kind='users' AND id=$1 AND NOT coalesce(data->'data'->'roles','[]'::jsonb) ? $2::text")
+        .bind(user)
+        .bind(admin.to_string())
+        .execute(&mut *connection)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
 }
 
 /// Validate the role ids assigned to a user: each must be an existing role.

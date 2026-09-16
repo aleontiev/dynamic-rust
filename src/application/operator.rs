@@ -110,6 +110,7 @@ pub async fn session(
             .await
             .map_err(ApiError::internal)?;
     }
+    super::core::admit_superuser(&app, &mut tx, id, &email).await?;
     let token = random();
     sqlx::query("DELETE FROM app_sessions WHERE expires<now()")
         .execute(&mut *tx)

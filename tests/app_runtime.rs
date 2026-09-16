@@ -629,8 +629,8 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             .0,
             200
         );
-        // Roles can be created by people whose roles allow it; this viewer's
-        // cannot. Every other built-in resource is read-only through the API.
+        // Roles, dashboards and views can be created by people whose roles allow
+        // it; this viewer's cannot. Every other built-in resource is read-only.
         assert_eq!(
             call(
                 &f.app,
@@ -640,7 +640,11 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             )
             .await
             .0,
-            if kind == "roles" { 403 } else { 405 }
+            if matches!(kind, "roles" | "dashboards" | "views") {
+                403
+            } else {
+                405
+            }
         );
     }
     for (method, status) in [("PUT", 403), ("PATCH", 403), ("DELETE", 405)] {
@@ -1075,6 +1079,30 @@ async fn operator_grants_open_sessions_for_named_users_only_when_valid() {
     let (status, _, me) = call(&f.app, "GET", "/api/admin/users/me/", Some(&cookie)).await;
     assert_eq!(status, 200, "{me}");
     assert_eq!(me["user"]["email"], "owner@example.org");
+    // A superuser signing in holds the managed Admin role, so their own record
+    // shows the access the platform guarantees them; anyone else holds nothing.
+    let (_, _, roles) = call(&f.app, "GET", "/api/admin/roles/", Some(&cookie)).await;
+    let admin = roles["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Admin")
+        .expect("managed Admin role")["id"]
+        .clone();
+    assert_eq!(me["user"]["roles"], json!([admin]));
+    let (_, _, metadata) = call(&f.app, "OPTIONS", "/api/admin/", Some(&cookie)).await;
+    assert_eq!(
+        metadata["resources"]["dashboards"]["permissions"]["create"],
+        true
+    );
+    assert_eq!(
+        metadata["resources"]["views"]["permissions"]["update"],
+        true
+    );
+    assert_eq!(
+        metadata["resources"]["roles"]["fields"]["permissions"]["resources"]["views"]["conditional"],
+        false
+    );
     // A second grant reuses the same user record rather than creating another.
     let (_, _, again) = post(
         &f.app,
