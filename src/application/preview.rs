@@ -118,9 +118,10 @@ pub(super) async fn redeem(
 }
 pub(super) async fn shell() -> Response {
     let nonce = random();
+    // The shell never runs embedded, so it reports to no one.
     let html = format!(
         "<!doctype html><html><head><title>Return to preview</title><meta name=\"referrer\" content=\"no-referrer\"></head><body><p>Returning to your app preview…</p><script nonce=\"{nonce}\">{}</script></body></html>",
-        include_str!("templates/app-preview.js")
+        bridge_script(&[])
     );
     let mut response = Html(html).into_response();
     response.headers_mut().insert(header::CONTENT_SECURITY_POLICY,format!("default-src 'none'; script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'").parse().unwrap());
@@ -129,15 +130,19 @@ pub(super) async fn shell() -> Response {
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
 }
+/// The bridge script with the preview origins it may report navigation to.
+pub(super) fn bridge_script(preview_origins: &[String]) -> String {
+    include_str!("templates/app-preview.js").replace(
+        "__DREAM_PREVIEW_ORIGINS__",
+        &serde_json::to_string(preview_origins).unwrap_or_else(|_| "[]".into()),
+    )
+}
 pub(super) async fn script(State(app): State<App>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "application/javascript"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        include_str!("templates/app-preview.js").replace(
-            "__DREAM_PREVIEW_ORIGINS__",
-            &serde_json::to_string(&app.preview_origins).unwrap_or_else(|_| "[]".into()),
-        ),
+        bridge_script(&app.preview_origins),
     )
 }

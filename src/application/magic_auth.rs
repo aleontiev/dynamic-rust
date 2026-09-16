@@ -88,6 +88,7 @@ pub(super) async fn login(State(app): State<App>) -> Response {
         .unwrap_or_else(|| "<link id=\"brand-favicon\" rel=\"icon\">".into());
     let company = escape(company);
     // Substituted branding is never interpreted as another template marker.
+    let preview_script = super::preview::bridge_script(&app.preview_origins);
     let html: String = include_str!("templates/app-login.html")
         .split("@@")
         .enumerate()
@@ -101,7 +102,7 @@ pub(super) async fn login(State(app): State<App>) -> Response {
                     "LOGO" => &logo,
                     "ICON" => &icon,
                     "NONCE" => &nonce,
-                    "PREVIEW_SCRIPT" => include_str!("templates/app-preview.js"),
+                    "PREVIEW_SCRIPT" => &preview_script,
                     "GOOGLE" => {
                         if app.google_auth.is_some() {
                             "<a class=\"google\" href=\"/api/auth/google\">Continue with Google</a>"

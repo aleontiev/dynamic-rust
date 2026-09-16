@@ -926,6 +926,18 @@ async fn preview_handoffs_are_origin_checked_expiring_one_use_and_partitioned() 
             .contains("const previewOrigins = [];")
     );
     plain.close().await;
+    // The sign-in page and the return shell inline the same script, substituted the same way.
+    let (_, _, login) = call(&fixture.app, "GET", "/api/login/", None).await;
+    let login = login.as_str().unwrap_or_default().to_owned();
+    assert!(login.contains("const previewOrigins = [\"https://dreamy.example.com\"];"));
+    assert!(!login.contains("__DREAM_PREVIEW_ORIGINS__"));
+    let (_, _, shell) = call(&fixture.app, "GET", "/api/preview/finish", None).await;
+    assert!(
+        shell
+            .as_str()
+            .unwrap_or_default()
+            .contains("const previewOrigins = [];")
+    );
     let origin = "https://dummy.example.org";
     let nonce = "a".repeat(64);
     let (status, headers, _) = call(&fixture.app, "GET", "/api/login/", None).await;
