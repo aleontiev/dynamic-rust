@@ -490,7 +490,7 @@ async fn magic_link_expiry_failure_and_existing_user() {
         post(
             &f.app,
             "/api/auth/magic-link",
-            json!({"email":"expired@example.org","next":"/orders/?state=draft"}),
+            json!({"email":"next-page@example.org","next":"/orders/?state=draft"}),
             None
         )
         .await
@@ -511,7 +511,7 @@ async fn magic_link_expiry_failure_and_existing_user() {
         post(
             &f.app,
             "/api/auth/magic-link",
-            json!({"email":"expired@example.org","next":"https://evil.example.org/"}),
+            json!({"email":"next-elsewhere@example.org","next":"https://evil.example.org/"}),
             None
         )
         .await
