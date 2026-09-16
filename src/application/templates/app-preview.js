@@ -1,6 +1,14 @@
 // Runs on the app origin. Credentials never pass to the Dreamy parent page.
 (() => {
   const key = 'dream.preview.request';
+  // Embedded in a Dreamy preview, tell the parent where the app has navigated so
+  // its address bar follows along; only the configured preview origins are told.
+  const previewOrigins = __DREAM_PREVIEW_ORIGINS__;
+  if (window.parent !== window && previewOrigins.length) {
+    const report = () => { for (const origin of previewOrigins) { try { window.parent.postMessage({type:'dream-preview-location', href: location.href}, origin); } catch {} } };
+    for (const method of ['pushState','replaceState']) { const original = history[method]; history[method] = function(...args) { const result = original.apply(this, args); setTimeout(report, 0); return result; }; }
+    addEventListener('popstate', report); addEventListener('hashchange', report); addEventListener('DOMContentLoaded', report, {once:true}); report();
+  }
   const read = () => { try { const value=JSON.parse(sessionStorage.getItem(key));return value && Date.now()-value.started<15*60*1000 ? value : null; } catch { return null; } };
   const post = async (path,body) => { const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)});if(!r.ok)throw Error('Sign-in could not return to the preview. Please try again.');return r.json(); };
   window.dreamPreviewAuthenticate = (method,email) => {

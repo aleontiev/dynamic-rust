@@ -129,12 +129,15 @@ pub(super) async fn shell() -> Response {
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     response
 }
-pub(super) async fn script() -> impl IntoResponse {
+pub(super) async fn script(State(app): State<App>) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "application/javascript"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        include_str!("templates/app-preview.js"),
+        include_str!("templates/app-preview.js").replace(
+            "__DREAM_PREVIEW_ORIGINS__",
+            &serde_json::to_string(&app.preview_origins).unwrap_or_else(|_| "[]".into()),
+        ),
     )
 }

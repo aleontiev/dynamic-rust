@@ -908,6 +908,24 @@ async fn core_runtime_only_exposes_public_core_fields() {
 #[ignore = "requires isolated PostgreSQL"]
 async fn preview_handoffs_are_origin_checked_expiring_one_use_and_partitioned() {
     let fixture = Fixture::with_preview(true).await;
+    // The bridge script names the preview origins it may report navigation to, and nothing else.
+    let (status, _, script) = call(&fixture.app, "GET", "/api/preview/script.js", None).await;
+    assert_eq!(status, 200);
+    let script = script.as_str().unwrap_or_default().to_owned();
+    assert!(
+        script.contains("const previewOrigins = [\"https://dreamy.example.com\"];"),
+        "{script}"
+    );
+    assert!(script.contains("dream-preview-location"));
+    let plain = Fixture::new().await;
+    let (_, _, unembedded) = call(&plain.app, "GET", "/api/preview/script.js", None).await;
+    assert!(
+        unembedded
+            .as_str()
+            .unwrap_or_default()
+            .contains("const previewOrigins = [];")
+    );
+    plain.close().await;
     let origin = "https://dummy.example.org";
     let nonce = "a".repeat(64);
     let (status, headers, _) = call(&fixture.app, "GET", "/api/login/", None).await;
