@@ -931,20 +931,97 @@ fn predicate(
             query.push(")");
         }
         PermissionFilter::Condition { lookup, value } => {
-            let name = lookup.strip_suffix("__exact").unwrap_or(lookup);
-            resource
-                .field(name)
-                .ok_or_else(|| ApiError::Parse("Unknown row permission field".into()))?;
-            if ["id", "created", "updated"].contains(&name) {
-                query.push(format!("{name}::text"));
-            } else {
-                query.push("data->>").push_bind(name.to_owned());
-            }
-            query
-                .push(" IS NOT DISTINCT FROM ")
-                .push_bind(scope_value(value, resource));
+            condition(query, resource, lookup, value)?;
         }
     }
+    Ok(())
+}
+/// One row-permission comparison. Numeric fields compare as numbers (a value
+/// that is not a number matches nothing), everything else as text; `in` is a
+/// disjunction of comparisons and `icontains` a case-insensitive substring.
+fn condition(
+    query: &mut QueryBuilder<'_, Postgres>,
+    resource: &Resource,
+    lookup: &str,
+    value: &Value,
+) -> Result<(), ApiError> {
+    let (name, operator) = crate::split_lookup(lookup);
+    let field = resource
+        .field(name)
+        .ok_or_else(|| ApiError::Parse("Unknown row permission field".into()))?;
+    let numeric = matches!(
+        field.kind,
+        FieldKind::Integer | FieldKind::Decimal | FieldKind::Float | FieldKind::Money
+    ) && operator != "icontains";
+    let column = |query: &mut QueryBuilder<'_, Postgres>| {
+        if ["id", "created", "updated"].contains(&name) {
+            query.push(format!("{name}::text"));
+        } else {
+            query.push("(data->>").push_bind(name.to_owned()).push(")");
+            if numeric {
+                query.push("::numeric");
+            }
+        }
+    };
+    if operator == "isnull" {
+        column(query);
+        query.push(if value.as_bool().unwrap_or(true) {
+            " IS NULL"
+        } else {
+            " IS NOT NULL"
+        });
+        return Ok(());
+    }
+    let values: Vec<&Value> = if operator == "in" {
+        value
+            .as_array()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default()
+    } else {
+        vec![value]
+    };
+    if values.is_empty() {
+        query.push("false");
+        return Ok(());
+    }
+    query.push("(");
+    for (index, item) in values.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        let text = scope_value(item, resource);
+        let comparison = match operator {
+            "gt" => " > ",
+            "gte" => " >= ",
+            "lt" => " < ",
+            "lte" => " <= ",
+            "icontains" => " ILIKE ",
+            _ => " = ",
+        };
+        if numeric {
+            match text.trim().parse::<f64>().ok().filter(|v| v.is_finite()) {
+                Some(number) => {
+                    column(query);
+                    query.push(comparison).push_bind(number);
+                }
+                None => {
+                    query.push("false");
+                }
+            }
+        } else if operator == "icontains" {
+            column(query);
+            query.push(comparison).push_bind(format!(
+                "%{}%",
+                text.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            ));
+        } else {
+            column(query);
+            query.push(comparison).push_bind(text);
+        }
+    }
+    query.push(")");
     Ok(())
 }
 fn scope_value(value: &Value, resource: &Resource) -> String {
@@ -973,12 +1050,12 @@ fn check_proposed_scope(resource: &Resource, record: &Value) -> Result<(), ApiEr
                 };
                 result != *negated
             }
-            PermissionFilter::Condition { lookup, value } => {
-                let v = &record[lookup.strip_suffix("__exact").unwrap_or(lookup)];
-                !v.is_null()
-                    && v.as_str().map_or_else(|| v.to_string(), str::to_owned)
-                        == scope_value(value, resource)
-            }
+            PermissionFilter::Condition { lookup, value } => crate::condition_matches(
+                record,
+                lookup,
+                value,
+                resource.row_actor_id.as_deref().unwrap_or_default(),
+            ),
         }
     }
     if resource

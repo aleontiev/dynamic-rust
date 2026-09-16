@@ -12,11 +12,14 @@
 //!  "users": {"list": true}}
 //! ```
 //!
-//! A condition is an object whose keys are field names (all of which must
-//! match), or one of `$or`, `$and` (arrays of conditions) and `$not`. Values
-//! are scalars or the actor reference `$user.id`. Rules combine with the
-//! union semantics of Dynamic REST role grants: any role that grants an
-//! operation grants it, and conditional rules are OR-ed together.
+//! A condition is an object whose keys are field lookups (all of which must
+//! match), or one of `$or`, `$and` (arrays of conditions) and `$not`. A lookup
+//! is a field name with an optional operator suffix — `amount__gte`,
+//! `status__in`, `name__icontains`, `closed__isnull` — defaulting to exact
+//! equality. Values are scalars or the actor reference `$user.id`; `in` takes
+//! an array of them and `isnull` a boolean. Rules combine with the union
+//! semantics of Dynamic REST role grants: any role that grants an operation
+//! grants it, and conditional rules are OR-ed together.
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
@@ -25,6 +28,88 @@ use crate::{PermissionFilter, Resource};
 
 /// The operations an access map can grant.
 pub const OPERATIONS: [&str; 5] = ["list", "read", "create", "update", "delete"];
+
+/// The comparison operators a condition lookup may carry after `__`.
+pub const CONDITION_OPERATORS: [&str; 8] = [
+    "exact",
+    "in",
+    "icontains",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "isnull",
+];
+
+/// Split a condition lookup into its field and operator (`exact` when absent).
+#[must_use]
+pub fn split_lookup(lookup: &str) -> (&str, &str) {
+    match lookup.rsplit_once("__") {
+        Some((field, operator)) if CONDITION_OPERATORS.contains(&operator) => (field, operator),
+        _ => (lookup, "exact"),
+    }
+}
+
+/// Whether a condition holds for one record, with `actor_id` standing in for
+/// `$user.id`. Numbers compare numerically, everything else as text; `in`
+/// matches any of its values, `icontains` is a case-insensitive substring
+/// test, and a missing field counts as null.
+#[must_use]
+pub fn condition_matches(record: &Value, lookup: &str, expected: &Value, actor_id: &str) -> bool {
+    use std::cmp::Ordering;
+    let (field, operator) = split_lookup(lookup);
+    let actual = &record[field];
+    let resolve = |value: &Value| -> Value {
+        if value == "$user.id" {
+            Value::String(actor_id.to_owned())
+        } else {
+            value.clone()
+        }
+    };
+    let as_text = |value: &Value| {
+        value
+            .as_str()
+            .map_or_else(|| value.to_string(), str::to_owned)
+    };
+    let number = |value: &Value| -> Option<f64> {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+    };
+    let compare = |expected: &Value| -> Option<Ordering> {
+        if actual.is_null() {
+            return None;
+        }
+        match (number(actual), number(expected)) {
+            (Some(a), Some(b)) => a.partial_cmp(&b),
+            _ => Some(as_text(actual).cmp(&as_text(expected))),
+        }
+    };
+    let equals = |expected: &Value| compare(expected) == Some(Ordering::Equal);
+    match operator {
+        "isnull" => actual.is_null() == expected.as_bool().unwrap_or(true),
+        "in" => expected
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| equals(&resolve(item)))),
+        "icontains" => {
+            !actual.is_null()
+                && as_text(actual)
+                    .to_lowercase()
+                    .contains(&as_text(&resolve(expected)).to_lowercase())
+        }
+        "gt" => compare(&resolve(expected)) == Some(Ordering::Greater),
+        "gte" => matches!(
+            compare(&resolve(expected)),
+            Some(Ordering::Greater | Ordering::Equal)
+        ),
+        "lt" => compare(&resolve(expected)) == Some(Ordering::Less),
+        "lte" => matches!(
+            compare(&resolve(expected)),
+            Some(Ordering::Less | Ordering::Equal)
+        ),
+        _ => equals(&resolve(expected)),
+    }
+}
 
 /// Rules for one resource keyed by operation. A `false` rule is not stored:
 /// it grants nothing and therefore has no effect under union semantics.
@@ -131,25 +216,46 @@ fn parse_condition(
                 children: vec![parse_condition(value, fields, depth + 1)?],
             },
             _ => {
-                let name = key.strip_suffix("__exact").unwrap_or(key);
+                let (name, operator) = split_lookup(key);
                 if !fields.contains(name) {
                     return Err(format!("unknown field {name}"));
                 }
-                if !(value.is_string() || value.is_number() || value.is_boolean()) {
-                    return Err(format!(
-                        "{name} must compare with a string, number or boolean."
-                    ));
-                }
-                if value
-                    .as_str()
-                    .is_some_and(|s| s.starts_with('$') && s != "$user.id")
-                {
-                    return Err(format!(
-                        "{name}: only $user.id may reference the signed-in user."
-                    ));
+                let scalar = |value: &Value| -> Result<(), String> {
+                    if !(value.is_string() || value.is_number() || value.is_boolean()) {
+                        return Err(format!(
+                            "{name} must compare with a string, number or boolean."
+                        ));
+                    }
+                    if value
+                        .as_str()
+                        .is_some_and(|s| s.starts_with('$') && s != "$user.id")
+                    {
+                        return Err(format!(
+                            "{name}: only $user.id may reference the signed-in user."
+                        ));
+                    }
+                    Ok(())
+                };
+                match operator {
+                    "in" => match value.as_array().filter(|items| !items.is_empty()) {
+                        Some(items) => items.iter().try_for_each(scalar)?,
+                        None => {
+                            return Err(format!("{name}__in needs a non-empty list of values."));
+                        }
+                    },
+                    "isnull" => {
+                        if !value.is_boolean() {
+                            return Err(format!("{name}__isnull must be true or false."));
+                        }
+                    }
+                    _ => scalar(value)?,
                 }
                 PermissionFilter::Condition {
-                    lookup: name.into(),
+                    lookup: if operator == "exact" {
+                        name.into()
+                    } else {
+                        format!("{name}__{operator}")
+                    },
                     value: value.clone(),
                 }
             }
@@ -231,6 +337,76 @@ mod tests {
             matches!(&map["loans"]["update"], PermissionFilter::Group { connector, children, .. } if connector == "or" && matches!(children[1], PermissionFilter::Group { negated: true, .. }))
         );
         assert_eq!(map["users"]["list"], PermissionFilter::All);
+    }
+
+    #[test]
+    fn parses_operators_and_evaluates_them_on_records() {
+        let map = parse_access_map(
+            &json!({"loans": {"list": {"status__in": ["open", "$user.id"], "owner__icontains": "ann", "status__gte": 3, "owner__isnull": false}}}),
+            &targets(),
+        )
+        .unwrap();
+        let PermissionFilter::Group { children, .. } = &map["loans"]["list"] else {
+            panic!("expected a group");
+        };
+        assert_eq!(
+            children
+                .iter()
+                .map(|c| match c {
+                    PermissionFilter::Condition { lookup, .. } => lookup.as_str(),
+                    _ => "?",
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                "owner__icontains",
+                "owner__isnull",
+                "status__gte",
+                "status__in"
+            ]
+        );
+        assert_eq!(split_lookup("owner__exact"), ("owner", "exact"));
+        assert_eq!(split_lookup("owner__id"), ("owner__id", "exact"));
+        for (value, message) in [
+            (json!({"status__in": []}), "non-empty list"),
+            (json!({"status__in": "open"}), "non-empty list"),
+            (
+                json!({"status__in": [{"x": 1}]}),
+                "string, number or boolean",
+            ),
+            (json!({"status__isnull": "yes"}), "true or false"),
+            (json!({"status__gte": [1]}), "string, number or boolean"),
+        ] {
+            let error =
+                parse_access_map(&json!({"loans": {"list": value}}), &targets()).unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+
+        let record = json!({"amount": 10, "status": "open", "name": "Annual audit", "owner": "u1"});
+        for (lookup, expected, holds) in [
+            ("amount", json!(10), true),
+            ("amount", json!("10"), true),
+            ("amount__gt", json!(9.5), true),
+            ("amount__gte", json!(11), false),
+            ("amount__lt", json!(11), true),
+            ("amount__lte", json!(9), false),
+            ("status__in", json!(["closed", "open"]), true),
+            ("status__in", json!(["closed"]), false),
+            ("name__icontains", json!("AUDIT"), true),
+            ("name__icontains", json!("budget"), false),
+            ("status__gte", json!("m"), true),
+            ("owner__in", json!(["$user.id"]), true),
+            ("owner", json!("$user.id"), true),
+            ("missing__isnull", json!(true), true),
+            ("owner__isnull", json!(true), false),
+            ("owner__isnull", json!(false), true),
+            ("missing__gt", json!(1), false),
+        ] {
+            assert_eq!(
+                condition_matches(&record, lookup, &expected, "u1"),
+                holds,
+                "{lookup} {expected}"
+            );
+        }
     }
 
     #[test]

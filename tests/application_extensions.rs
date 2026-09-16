@@ -996,6 +996,131 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         "the condition applies to the row as it is, not as proposed"
     );
 
+    // Conditions carry operators: numbers compare numerically, `in` lists,
+    // `icontains` matches text, `isnull` tests presence.
+    let (status, edited) = request(&app, "PATCH", &format!("/api/admin/roles/{role}/"), owner_cookie, json!({"permissions":{
+        "orders":{"list":{"$or":[{"quantity__gte":5,"name__icontains":"PAPER"},{"state__in":["shipped","closed"]}]},"read":true,"update":{"received__lte":0,"quantity__lt":10,"state__isnull":false}},
+        "suppliers":{"list":true,"read":true}
+    }})).await;
+    assert_eq!(status, 200, "{edited}");
+    let (_, big) = request(
+        &app,
+        "POST",
+        "/api/admin/orders/",
+        owner_cookie,
+        json!({"name":"Paper reams","supplier":supplier,"quantity":12}),
+    )
+    .await;
+    let big = big["order"]["id"].as_str().unwrap().to_owned();
+    let (_, small) = request(
+        &app,
+        "POST",
+        "/api/admin/orders/",
+        owner_cookie,
+        json!({"name":"Paper clips","supplier":supplier,"quantity":2}),
+    )
+    .await;
+    let small = small["order"]["id"].as_str().unwrap().to_owned();
+    let (_, shipped) = request(
+        &app,
+        "POST",
+        "/api/admin/orders/",
+        owner_cookie,
+        json!({"name":"Toner","supplier":supplier,"quantity":1}),
+    )
+    .await;
+    let shipped = shipped["order"]["id"].as_str().unwrap().to_owned();
+    sqlx::query("UPDATE app_records SET data=data||'{\"state\":\"shipped\"}' WHERE id=$1")
+        .bind(Uuid::parse_str(&shipped).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, listed) = request(
+        &app,
+        "GET",
+        "/api/admin/orders/?sort[]=name",
+        clerk_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{listed}");
+    let names: Vec<&str> = listed["orders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|o| o["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Paper (draft)", "Paper reams", "Toner"],
+        "{listed}"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &format!("/api/admin/orders/{small}/"),
+            clerk_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        200,
+        "reading stays unconditional"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/orders/{small}/"),
+            clerk_cookie,
+            json!({"name":"Paper clips (boxed)"})
+        )
+        .await
+        .0,
+        200,
+        "nothing received yet and quantity 2 < 10"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/orders/{big}/"),
+            clerk_cookie,
+            json!({"name":"Paper reams (boxed)"})
+        )
+        .await
+        .0,
+        404,
+        "quantity 12 is not < 10"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/orders/{small}/"),
+            clerk_cookie,
+            json!({"received":1})
+        )
+        .await
+        .0,
+        403,
+        "setting received leaves the update condition"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/orders/{small}/"),
+            clerk_cookie,
+            json!({"quantity":30})
+        )
+        .await
+        .0,
+        403,
+        "the proposed quantity must still satisfy the condition"
+    );
+
     // Editing the role changes what its holders may do on their next request.
     let (status, edited) = request(
         &app,

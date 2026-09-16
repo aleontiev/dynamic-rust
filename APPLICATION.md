@@ -36,13 +36,17 @@ scope. Hidden/write-only fields are excluded from record responses.
 
 Roles are also records: `/api/admin/roles/` holds a `name` and a `permissions`
 access map, grouped by resource and operation. A rule is `true`, `false`, or a
-condition the rows must meet — an object of field names whose values are
-scalars or `$user.id`, or `$or`, `$and` and `$not` groups of conditions:
+condition the rows must meet — an object of field lookups whose values are
+scalars or `$user.id`, or `$or`, `$and` and `$not` groups of conditions. A
+lookup is a field name with an optional operator: `exact` (the default), `in`
+(a list of values), `icontains`, `gt`, `gte`, `lt`, `lte`, and `isnull` (a
+boolean). Numeric fields compare as numbers, other fields as text:
 
 ```json
 {"orders": {"list": true, "read": true, "create": true,
-            "update": {"$or": [{"state": "draft"}, {"owner": "$user.id"}]}},
- "suppliers": {"list": true, "read": true},
+            "update": {"$or": [{"state__in": ["draft", "review"]},
+                               {"owner": "$user.id", "quantity__lte": 10}]}},
+ "suppliers": {"list": {"name__icontains": "acme"}, "read": true},
  "users": {"list": true, "read": true, "update": true}}
 ```
 
