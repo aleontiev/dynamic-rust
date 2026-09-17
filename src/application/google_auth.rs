@@ -198,6 +198,20 @@ struct Identity {
     #[serde(default)]
     name: String,
     hd: Option<String>,
+    picture: Option<String>,
+}
+/// Google's profile photo, accepted only as an https URL on a Google image
+/// host; anything else is dropped rather than stored on the user.
+fn picture_url(value: Option<&str>) -> Option<&str> {
+    let value = value?;
+    let parsed = url::Url::parse(value).ok()?;
+    let host = parsed.host_str()?;
+    (parsed.scheme() == "https"
+        && value.len() <= 2048
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && (host == "googleusercontent.com" || host.ends_with(".googleusercontent.com")))
+    .then_some(value)
 }
 fn opaque(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
@@ -314,6 +328,11 @@ pub(super) async fn callback(
         }
         id
     };
+    // A person without a profile photo gets the one Google shows for them.
+    if let Some(picture) = picture_url(identity.picture.as_deref()) {
+        sqlx::query("UPDATE app_records SET data=jsonb_set(data,'{photo}',$2),updated=now() WHERE kind='users' AND id=$1 AND coalesce(data->>'photo','')=''")
+            .bind(id).bind(json!(picture)).execute(&mut *tx).await.map_err(ApiError::internal)?;
+    }
     super::core::admit_superuser(&app, &mut tx, id, &email).await?;
     let session = random();
     sqlx::query("DELETE FROM app_sessions WHERE expires<now()")

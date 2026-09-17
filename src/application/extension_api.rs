@@ -151,6 +151,80 @@ pub(super) async fn retrieve(
         .insert(app.registry.models[&kind].resource.name.clone(), row);
     Ok(Json(document))
 }
+/// The records a relation field points at, paged like a list
+/// (`GET /api/admin/loans/{id}/guarantors/`): the admin reads a many-relation
+/// through this endpoint, as it did with Dynamic REST, and shows each as a link.
+/// A single relation answers with at most one record. Only records the actor
+/// may list are returned; the record itself must be readable.
+pub(super) async fn related(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path((kind, id, field)): Path<(String, Uuid, String)>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Result<Json<ApiDocument>, ApiError> {
+    let actor = app.actor(&user(&app, &headers).await?).await?;
+    let model = app.registry.models.get(&kind).ok_or(ApiError::NotFound)?;
+    let related = model
+        .resource
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .and_then(|f| f.related_resource.clone())
+        .ok_or(ApiError::NotFound)?;
+    if !app.registry.models.contains_key(&related) {
+        return Err(ApiError::NotFound);
+    }
+    let mut tx = app.pool.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut ctx = Context::new(&mut tx, &app.registry, actor);
+    let record = ctx.get(&kind, id).await?;
+    let ids: Vec<String> = match &record[&field] {
+        Value::String(id) => vec![id.clone()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect(),
+        _ => vec![],
+    };
+    let raw = raw.unwrap_or_default();
+    let features = QueryFeatures::parse(&raw, 1000)?;
+    if ids.is_empty() {
+        return Ok(Json(ApiDocument::many(
+            related,
+            vec![],
+            PageMeta::new(features.page, features.per_page, 0),
+        )));
+    }
+    let query = ids
+        .iter()
+        .map(|id| format!("filter{{id.in}}={id}"))
+        .chain(std::iter::once(raw))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("&");
+    let features = QueryFeatures::parse(&query, 1000)?;
+    let (mut rows, total) = ctx.list(&related, &features).await?;
+    // Keep the order the record lists them in, as far as this page holds them.
+    rows.sort_by_key(|record| {
+        ids.iter()
+            .position(|id| record["id"].as_str() == Some(id))
+            .unwrap_or(usize::MAX)
+    });
+    let mut document = ApiDocument::many(
+        related.clone(),
+        vec![],
+        PageMeta::new(features.page, features.per_page, total),
+    );
+    sideload(&mut ctx, &related, &rows, &features, &mut document).await?;
+    for row in &mut rows {
+        project(row, &features);
+    }
+    document.resources.insert(related, Value::Array(rows));
+    Ok(Json(document))
+}
 fn project(row: &mut Value, features: &QueryFeatures) {
     row.as_object_mut().unwrap().retain(|name, _| {
         name == "id"

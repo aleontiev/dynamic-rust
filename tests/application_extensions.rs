@@ -107,6 +107,7 @@ fn registry() -> Registry {
     registry
         .model(
             Model::new("suppliers", "supplier")
+                .icon("truck")
                 .field("name", FieldKind::String)
                 .required("name")
                 .grant("buyer", &all),
@@ -119,6 +120,7 @@ fn registry() -> Registry {
                 .required("name")
                 .relation("supplier", "suppliers")
                 .required("supplier")
+                .relations("backup_suppliers", "suppliers")
                 .field("quantity", FieldKind::Integer)
                 .required("quantity")
                 .field("received", FieldKind::Integer)
@@ -1437,6 +1439,140 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
     )
     .await;
     assert_eq!(one["suppliers"][0]["name"], "Acme");
+
+    // A model's icon reaches the admin, and a many-relation is a list of ids
+    // that must all exist, sideloads like a single one, and keeps its targets.
+    let (_, meta) = request(&app, "OPTIONS", "/api/admin/", owner_cookie, Value::Null).await;
+    assert_eq!(meta["resources"]["suppliers"]["icon"], "truck");
+    assert_eq!(meta["resources"]["orders"]["icon"], "table");
+    let backups = &meta["resources"]["orders"]["fields"]["backup_suppliers"];
+    assert_eq!(backups["type"], "many", "{backups}");
+    assert_eq!(backups["related"], "suppliers");
+    assert_eq!(backups["many"], true);
+    let (status, spare) = request(
+        &app,
+        "POST",
+        "/api/admin/suppliers/",
+        owner_cookie,
+        json!({"name":"Spare"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{spare}");
+    let spare = spare["supplier"]["id"].clone();
+    for (body, expected) in [
+        (
+            json!({"name":"Backed","supplier":supplier,"quantity":1,"backup_suppliers":[spare, supplier]}),
+            201,
+        ),
+        (
+            json!({"name":"Unknown","supplier":supplier,"quantity":1,"backup_suppliers":[Uuid::new_v4()]}),
+            400,
+        ),
+        (
+            json!({"name":"Scalar","supplier":supplier,"quantity":1,"backup_suppliers":spare}),
+            400,
+        ),
+        (
+            json!({"name":"Junk","supplier":supplier,"quantity":1,"backup_suppliers":["not-an-id"]}),
+            400,
+        ),
+    ] {
+        let name = body["name"].clone();
+        let (status, created) =
+            request(&app, "POST", "/api/admin/orders/", owner_cookie, body).await;
+        assert_eq!(status, expected, "{name}: {created}");
+    }
+    let (_, backed) = request(
+        &app,
+        "GET",
+        "/api/admin/orders/?filter{name}=Backed&include[]=backup_suppliers.*",
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        backed["orders"][0]["backup_suppliers"],
+        json!([spare, supplier])
+    );
+    let mut sideloaded: Vec<&str> = backed["suppliers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["name"].as_str().unwrap())
+        .collect();
+    sideloaded.sort_unstable();
+    assert_eq!(sideloaded, ["Acme", "Spare"]);
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("/api/admin/suppliers/{}/", spare.as_str().unwrap()),
+            owner_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        409,
+        "a supplier listed as a backup is still referenced"
+    );
+    // The records behind a relation are served as a page in the record's order,
+    // which is how the admin lists a many-relation on a detail page.
+    let backed_id = backed["orders"][0]["id"].as_str().unwrap().to_owned();
+    let (status, page) = request(
+        &app,
+        "GET",
+        &format!("/api/admin/orders/{backed_id}/backup_suppliers/?include[]=name&include[]=id&exclude[]=*&page=1&per_page=10"),
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(
+        page["suppliers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["Spare", "Acme"]
+    );
+    assert_eq!(page["meta"]["total_results"], 2);
+    let (status, one) = request(
+        &app,
+        "GET",
+        &format!("/api/admin/orders/{backed_id}/supplier/"),
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{one}");
+    assert_eq!(one["suppliers"].as_array().map(Vec::len), Some(1));
+    assert_eq!(one["suppliers"][0]["name"], "Acme");
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &format!("/api/admin/orders/{backed_id}/quantity/"),
+            owner_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        404,
+        "only relation fields have related records"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &format!("/api/admin/orders/{}/backup_suppliers/", Uuid::new_v4()),
+            owner_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        404
+    );
 
     // Legacy role names on a user still match the grants declared in code.
     sqlx::query(

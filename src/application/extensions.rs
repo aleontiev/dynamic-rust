@@ -251,6 +251,30 @@ impl Model {
         }
         self
     }
+    /// A field holding a list of ids of `target` records (a loan's guarantors).
+    /// Every id must name an existing, readable record; the admin shows the
+    /// list as links and edits it with a search box.
+    pub fn relations(mut self, name: &str, target: &str) -> Self {
+        self = self.relation(name, target);
+        if let Some(field) = self.resource.fields.last_mut() {
+            field.many = true;
+        }
+        self
+    }
+    /// The Material Design icon (its `mdi-` name without the prefix, such as
+    /// `account` or `cash`) the admin shows for this model in the navigation
+    /// drawer, on its pages and on every field that references it. Without one
+    /// the admin uses `table`.
+    pub fn icon(self, icon: &str) -> Self {
+        let mut metadata = self
+            .resource
+            .metadata
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        metadata.insert("icon".into(), json!(icon));
+        self.metadata(Value::Object(metadata))
+    }
     pub fn grant(mut self, role: &str, operations: &[&str]) -> Self {
         self.resource.role_grants.insert(
             role.into(),
@@ -649,7 +673,8 @@ impl<'a> Context<'a> {
                     for related in self.registry.models.values() {
                         for field in &related.resource.fields {
                             if field.related_resource.as_deref()==Some(kind) {
-                                let used:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM app_records WHERE kind=$1 AND data->>$2=$3)").bind(&related.resource.plural_name).bind(&field.name).bind(id.to_string()).fetch_one(&mut *self.connection).await.map_err(ApiError::internal)?;
+                                let sql=if field.many {"SELECT EXISTS(SELECT 1 FROM app_records WHERE kind=$1 AND data->$2 @> to_jsonb($3::text))"} else {"SELECT EXISTS(SELECT 1 FROM app_records WHERE kind=$1 AND data->>$2=$3)"};
+                                let used:bool=sqlx::query_scalar(sql).bind(&related.resource.plural_name).bind(&field.name).bind(id.to_string()).fetch_one(&mut *self.connection).await.map_err(ApiError::internal)?;
                                 if used { return Err(ApiError::Conflict("This record is still referenced".into())); }
                             }
                         }
@@ -702,6 +727,41 @@ fn output(resource: &Resource, mut value: Value) -> Value {
         .retain(|name, _| resource.field(name).is_some_and(|f| !f.write_only));
     value
 }
+/// Every id a relation field holds must name an existing record the actor may
+/// read: referencing a record grants no access to a hidden row.
+async fn validate_references(
+    context: &mut Context<'_>,
+    field: &Field,
+    target: &str,
+    value: &Value,
+) -> Result<(), ApiError> {
+    let ids: Vec<Uuid> = match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+            .collect(),
+        _ => vec![Uuid::parse_str(value.as_str().unwrap_or_default()).map_err(ApiError::internal)?],
+    };
+    for id in ids {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM app_records WHERE kind=$1 AND id=$2)")
+                .bind(target)
+                .bind(id)
+                .fetch_one(&mut *context.connection)
+                .await
+                .map_err(ApiError::internal)?;
+        if !exists {
+            return Err(ApiError::Parse(format!(
+                "Unknown related record: {}",
+                field.name
+            )));
+        }
+        if context.registry.models.contains_key(target) {
+            context.get(target, id).await?;
+        }
+    }
+    Ok(())
+}
 async fn validate_record(
     context: &mut Context<'_>,
     model: &Model,
@@ -732,6 +792,11 @@ async fn validate_record(
             FieldKind::Float | FieldKind::Decimal | FieldKind::Money => {
                 value.as_f64().is_some_and(f64::is_finite)
             }
+            FieldKind::Relation if field.many => value.as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .all(|item| item.as_str().is_some_and(|s| Uuid::parse_str(s).is_ok()))
+            }),
             FieldKind::Uuid | FieldKind::Relation => {
                 value.as_str().is_some_and(|s| Uuid::parse_str(s).is_ok())
             }
@@ -742,26 +807,7 @@ async fn validate_record(
             return Err(ApiError::Parse(format!("Invalid value for {}", field.name)));
         }
         if let Some(target) = &field.related_resource {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM app_records WHERE kind=$1 AND id=$2)",
-            )
-            .bind(target)
-            .bind(Uuid::parse_str(value.as_str().unwrap()).map_err(ApiError::internal)?)
-            .fetch_one(&mut *context.connection)
-            .await
-            .map_err(ApiError::internal)?;
-            if !exists {
-                return Err(ApiError::Parse(format!(
-                    "Unknown related record: {}",
-                    field.name
-                )));
-            }
-            // Referencing a record does not grant access to a hidden row.
-            if context.registry.models.contains_key(target) {
-                context
-                    .get(target, Uuid::parse_str(value.as_str().unwrap()).unwrap())
-                    .await?;
-            }
+            validate_references(context, field, target, value).await?;
         }
     }
     for unique in &model.unique {

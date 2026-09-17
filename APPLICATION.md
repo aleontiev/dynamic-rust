@@ -74,6 +74,11 @@ step with the registered models; its name is fixed. A superuser who signs in
 holds it, so the owner's own record shows and carries full access from the
 first sign-in. Make other roles for narrower access.
 
+Signing in with Google also fills a person's `photo` — Google's profile picture
+URL — when they have none yet; a photo already set is kept. Users carry it as a
+read-only `image upload` field, and `/api/admin/users/me/` returns it so the
+admin shows it as the account avatar.
+
 Signing out with `/api/logout/?next=<page>` sends the browser to `/api/login/`
 remembering that page — a path on this app, an absolute URL on its origin, or
 the login URL an admin wraps it in — and the sign-in that follows, by email
@@ -93,8 +98,21 @@ built-in identities, identity verifications, dashboards and views ship that way,
 so only users, roles and providers are listed by default.
 
 Relationships use `.relation("supplier", "suppliers")`; `.required("supplier")`
-makes the reference mandatory. A referenced record must exist and be readable.
-Deleting referenced records fails. Unique field combinations reject duplicates.
+makes the reference mandatory. `.relations("backup_suppliers", "suppliers")`
+holds a list of ids instead (a `many` field in metadata): every id must name an
+existing, readable record, the admin lists them as links on the detail page and
+edits them with a search box, and `include[]=backup_suppliers.*` sideloads them
+like a single relation. `GET /api/admin/orders/UUID/backup_suppliers/` (or
+`/supplier/`) pages through the records a relation points at, in the record's
+order, under the related resource's name. A referenced record must exist and be
+readable. Deleting referenced records fails, including records listed in a
+many-relation.
+
+`.icon("truck")` names the Material Design icon (without the `mdi-` prefix) the
+admin shows for a model in the navigation drawer, on its pages, and on every
+field of another model that references it, so a `borrower` relation carries the
+borrower model's icon rather than a generic one. Without it the admin uses
+`table`. Unique field combinations reject duplicates.
 Models store validated JSON records; additive model fields do not require ALTER
 TABLE. Use `registry.migration("001_backfill", SQL)` for data migrations and custom
 indexes. Applied migration SQL cannot change. Migrations run with the app role,

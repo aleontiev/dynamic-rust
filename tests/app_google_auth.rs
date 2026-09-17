@@ -430,6 +430,66 @@ async fn google_links_only_authoritative_email_and_preserves_stable_subject() {
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL and private loopback broker"]
+async fn google_sign_in_sets_a_missing_profile_photo_from_a_google_host_only() {
+    let f = Fixture::new().await;
+    let photo = "https://lh3.googleusercontent.com/a/ACg8ocK=s96-c";
+    let sign_in = |subject: &str, email: &str, picture: Value| {
+        f.broker.lock().unwrap().profile = json!({"provider":"google","sub":subject,"email":email,"email_verified":true,"name":"Google Viewer","picture":picture});
+    };
+    // A new person: the photo Google shows for them becomes theirs.
+    sign_in("photo-one", "photo@gmail.com", json!(photo));
+    let (state, code, cookie) = f.start(&f.app).await;
+    let (_, h, _) = call(&f.app, &callback(&state, &code), Some(&cookie)).await;
+    let (_, _, me) = call(&f.app, "/api/admin/users/me/", Some(&session(&h))).await;
+    assert_eq!(me["user"]["photo"], photo);
+    // A photo already set is kept, whatever Google sends now.
+    sign_in(
+        "photo-one",
+        "photo@gmail.com",
+        json!("https://lh3.googleusercontent.com/a/other=s96-c"),
+    );
+    let (state, code, cookie) = f.start(&f.app).await;
+    let (_, h, _) = call(&f.app, &callback(&state, &code), Some(&cookie)).await;
+    let (_, _, me) = call(&f.app, "/api/admin/users/me/", Some(&session(&h))).await;
+    assert_eq!(me["user"]["photo"], photo);
+    // Only https URLs on Google's image hosts are stored.
+    for (subject, email, picture) in [
+        (
+            "photo-two",
+            "plain@gmail.com",
+            json!("http://lh3.googleusercontent.com/a/x"),
+        ),
+        (
+            "photo-three",
+            "elsewhere@gmail.com",
+            json!("https://attacker.example/photo.png"),
+        ),
+        ("photo-four", "none@gmail.com", Value::Null),
+    ] {
+        sign_in(subject, email, picture);
+        let (state, code, cookie) = f.start(&f.app).await;
+        let (_, h, _) = call(&f.app, &callback(&state, &code), Some(&cookie)).await;
+        let (_, _, me) = call(&f.app, "/api/admin/users/me/", Some(&session(&h))).await;
+        assert_eq!(me["user"]["email"], email);
+        assert!(me["user"]["photo"].is_null(), "{email}");
+    }
+    // The schema lists the photo as a read-only image the admin can show.
+    let request = Request::builder()
+        .method("OPTIONS")
+        .uri("/api/admin/users/")
+        .header("cookie", session(&h))
+        .body(Body::empty())
+        .unwrap();
+    let response = f.app.clone().oneshot(request).await.unwrap();
+    let schema: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap()).unwrap();
+    assert_eq!(schema["fields"]["photo"]["type"], "image upload");
+    assert_eq!(schema["fields"]["photo"]["read_only"], true);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL and private loopback broker"]
 async fn google_rejects_unverified_profiles_and_untrusted_redirects() {
     let f = Fixture::new().await;
     f.broker.lock().unwrap().reject_requests = true;

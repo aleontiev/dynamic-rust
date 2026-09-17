@@ -193,6 +193,7 @@ fn fields(kind: &str) -> Vec<(&str, &str)> {
         "users" => vec![
             ("name", "string"),
             ("email", "email"),
+            ("photo", "image upload"),
             ("roles", "list"),
             ("data", "json"),
         ],
@@ -317,9 +318,9 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
 }
 /// Built-in fields the list endpoint can filter and sort by.
 fn filterable(kind: &str, field: &str) -> bool {
-    !fields(kind)
-        .iter()
-        .any(|(name, typ)| *name == field && ["json", "list", "permissions"].contains(typ))
+    !fields(kind).iter().any(|(name, typ)| {
+        *name == field && ["json", "list", "permissions", "image upload"].contains(typ)
+    })
 }
 /// The resources an access map may name, for the permissions editor: their
 /// labels, and whether rules on them may carry conditions.
@@ -725,6 +726,7 @@ pub fn router(app: App) -> Router {
         .route("/admin/{kind}/",get(list).options(options).post(create))
         .route("/admin/{kind}/{id}/",get(retrieve).patch(update).put(replace).delete(delete))
         .route("/admin/{kind}/{id}/actions/{action}/",axum::routing::post(extension_api::action))
+        .route("/admin/{kind}/{id}/{field}/",get(extension_api::related))
         .route("/v0/s3/",get(s3)).with_state(app);
     Router::new().nest("/api", routes)
 }
