@@ -261,9 +261,9 @@ pub(crate) fn core_supports(kind: &str, operation: &str) -> bool {
     matches!(
         (kind, operation),
         (
-            "roles" | "dashboards" | "views",
+            "roles" | "dashboards" | "views" | "users",
             "create" | "update" | "delete"
-        ) | ("users", "create" | "update")
+        )
     )
 }
 /// The roles that exist, as choices for a user's `roles` field.

@@ -72,15 +72,16 @@ saved; `OPTIONS /api/admin/roles/` lists the resources rules may name under the
 `permissions` field, marking which accept conditions.
 
 Superusers, and holders of a role whose map grants those operations on `roles`
-and `users`, create, edit and delete roles, add users, and set the `roles` (and
-`name`) of users; deleting a role removes it from every user. `dashboards` and `views`
+and `users`, create, edit and delete roles, add and remove users (removing
+one ends their sessions and sign-in identities; nobody removes themselves), and
+set the `roles` (and `name`) of users; deleting a role removes it from every user. `dashboards` and `views`
 (the admin's saved pages) are written the same way. Everything else built in
 remains read-only. Role names must be unique; `*` and `authenticated` are
 reserved. Role entries on a user that are not record ids are still treated as
 role names, so applications that assigned roles by name keep working.
 
 `registry.migrate` provisions a managed **Admin** role granting every
-operation on every resource (users: list, read, create, update) and keeps its map in
+operation on every resource, users included and keeps its map in
 step with the registered models; its name is fixed. A superuser who signs in
 holds it, so the owner's own record shows and carries full access from the
 first sign-in. Make other roles for narrower access.

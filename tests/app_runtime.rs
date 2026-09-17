@@ -774,7 +774,7 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             }
         );
     }
-    for (method, status) in [("PUT", 403), ("PATCH", 403), ("DELETE", 405)] {
+    for (method, status) in [("PUT", 403), ("PATCH", 403), ("DELETE", 403)] {
         assert_eq!(
             call(
                 &f.app,

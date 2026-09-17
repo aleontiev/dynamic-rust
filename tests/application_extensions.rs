@@ -725,7 +725,7 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
     assert_eq!(admin_role["permissions"]["dashboards"]["create"], true);
     assert_eq!(
         admin_role["permissions"]["users"],
-        json!({"list":true,"read":true,"create":true,"update":true})
+        json!({"list":true,"read":true,"create":true,"update":true,"delete":true})
     );
     // Relations are described the way the admin renders them: as one/many with the related resource.
     let (_, meta) = request(
@@ -1313,6 +1313,58 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         "the name defaults to the address"
     );
     assert_eq!(defaulted["user"]["roles"], json!([]));
+    // Removing a person takes users.delete; it ends their sessions and
+    // sign-in identities, and nobody removes themselves.
+    let quiet = defaulted["user"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("/api/admin/users/{quiet}/"),
+            auditor_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        403
+    );
+    let (status, refused) = request(
+        &app,
+        "DELETE",
+        &format!("/api/admin/users/{owner}/"),
+        owner_cookie,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, 400, "{refused}");
+    assert!(
+        refused.to_string().contains("your own account"),
+        "{refused}"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "DELETE",
+            &format!("/api/admin/users/{quiet}/"),
+            owner_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        204
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &format!("/api/admin/users/{quiet}/"),
+            owner_cookie,
+            Value::Null
+        )
+        .await
+        .0,
+        404
+    );
     assert_eq!(
         request(
             &app,
@@ -1360,7 +1412,7 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         )
         .await
         .0,
-        405
+        403
     );
     assert_eq!(
         request(

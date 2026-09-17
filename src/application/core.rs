@@ -153,6 +153,31 @@ pub(super) async fn write(
                 .map_err(ApiError::internal)?;
             current
         }
+        ("users", "delete") => {
+            // Removing a person ends their sessions and sign-in identities; the
+            // records they made stay. Nobody removes themselves.
+            let id = id.ok_or(ApiError::NotFound)?;
+            if actor.id == id.to_string() {
+                return Err(invalid("id", "You cannot remove your own account."));
+            }
+            let current = fetch(connection, kind, id).await?;
+            sqlx::query("DELETE FROM app_sessions WHERE user_id=$1")
+                .bind(id)
+                .execute(&mut *connection)
+                .await
+                .map_err(ApiError::internal)?;
+            sqlx::query("DELETE FROM app_records WHERE kind IN ('identities','identity_verifications') AND data->>'user'=$1")
+                .bind(id.to_string())
+                .execute(&mut *connection)
+                .await
+                .map_err(ApiError::internal)?;
+            sqlx::query("DELETE FROM app_records WHERE kind='users' AND id=$1")
+                .bind(id)
+                .execute(&mut *connection)
+                .await
+                .map_err(ApiError::internal)?;
+            current
+        }
         ("roles", "delete") => {
             let id = id.ok_or(ApiError::NotFound)?;
             let current = fetch(connection, kind, id).await?;
@@ -296,7 +321,9 @@ pub(crate) fn admin_access_map(app_models: impl Iterator<Item = String>) -> Valu
             kind.into(),
             match kind {
                 "roles" | "dashboards" | "views" => all.clone(),
-                "users" => json!({"list":true,"read":true,"create":true,"update":true}),
+                "users" => {
+                    json!({"list":true,"read":true,"create":true,"update":true,"delete":true})
+                }
                 _ => json!({"list":true,"read":true}),
             },
         );
