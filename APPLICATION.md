@@ -26,6 +26,17 @@ pub fn register(registry: &mut Registry) -> Result<(), ApiError> {
 
 Default access is denied. `authenticated` is assigned to signed-in users; other
 roles come from the user's server-owned `roles` list, never request headers.
+
+Signing in is for the people the app knows: its superusers (the owners), and
+anyone an administrator added on the Users page — `POST /api/admin/users/`
+with an `email`, an optional `name` (defaulting to the address) and optional
+`roles`, which takes the `users` `create` grant the managed Admin role holds.
+An email link is only sent to such an address (a stranger's request answers
+403 with a message saying to ask an administrator), and Google sign-in for an
+unknown address ends on the sign-in page with the same advice; no account is
+ever created by signing in. The email is set once, when the person is added,
+and is read-only afterwards. So `authenticated` means every member of the app,
+never the public.
 `Model.resource` exposes Dynamic Rust's metadata, role grants, per-role field
 overrides, list columns and row filters. Row filters support boolean groups and
 exact comparisons, including `$user.id`. A role granted an operation without a
@@ -61,15 +72,15 @@ saved; `OPTIONS /api/admin/roles/` lists the resources rules may name under the
 `permissions` field, marking which accept conditions.
 
 Superusers, and holders of a role whose map grants those operations on `roles`
-and `users`, create, edit and delete roles and set the `roles` (and `name`) of
-users; deleting a role removes it from every user. `dashboards` and `views`
+and `users`, create, edit and delete roles, add users, and set the `roles` (and
+`name`) of users; deleting a role removes it from every user. `dashboards` and `views`
 (the admin's saved pages) are written the same way. Everything else built in
 remains read-only. Role names must be unique; `*` and `authenticated` are
 reserved. Role entries on a user that are not record ids are still treated as
 role names, so applications that assigned roles by name keep working.
 
 `registry.migrate` provisions a managed **Admin** role granting every
-operation on every resource (users: list, read, update) and keeps its map in
+operation on every resource (users: list, read, create, update) and keeps its map in
 step with the registered models; its name is fixed. A superuser who signs in
 holds it, so the owner's own record shows and carries full access from the
 first sign-in. Make other roles for narrower access.

@@ -127,7 +127,7 @@ impl Fixture {
             branding: json!({}),
             mail_endpoint: None,
             revision: "fixture".into(),
-            superusers: std::collections::BTreeSet::default(),
+            superusers: ["viewer@gmail.com".to_string()].into_iter().collect(),
             operator_secret: None,
         };
         let app = router(config.clone());
@@ -171,6 +171,17 @@ impl Fixture {
     }
     fn profile(&self, subject: &str, email: &str, hd: Option<&str>) {
         self.broker.lock().unwrap().profile = json!({"provider":"google","sub":subject,"email":email,"email_verified":true,"name":"Google Viewer","hd":hd});
+    }
+    /// An administrator added this address, so it may sign in.
+    async fn invite(&self, email: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'users',$2)")
+            .bind(id)
+            .bind(json!({"name":email,"email":email,"data":{}}))
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        id
     }
     async fn user(&self, email: &str) -> Uuid {
         let id = Uuid::new_v4();
@@ -414,12 +425,26 @@ async fn google_links_only_authoritative_email_and_preserves_stable_subject() {
             failed(&h, "email_link");
         }
     }
-    // New external-email users can sign in; future sign-ins use sub, even if email changes.
-    f.profile("stable-external", "new@example.net", None);
+    // A stranger cannot sign in at all: no account is created for them.
+    f.profile("stranger", "stranger@example.net", Some("example.net"));
+    let (state, code, cookie) = f.start(&f.app).await;
+    let (_, h, _) = call(&f.app, &callback(&state, &code), Some(&cookie)).await;
+    failed(&h, "no_account");
+    let strangers: i64 = sqlx::query_scalar("SELECT count(*) FROM app_records WHERE kind='users' AND data->>'email'='stranger@example.net'")
+        .fetch_one(&f.pool).await.unwrap();
+    assert_eq!(strangers, 0);
+    // An added external-email user signs in from their Google Workspace; future
+    // sign-ins use sub, even if email changes.
+    f.invite("new@example.net").await;
+    f.profile("stable-external", "new@example.net", Some("example.net"));
     let (state, code, cookie) = f.start(&f.app).await;
     let (_, h, _) = call(&f.app, &callback(&state, &code), Some(&cookie)).await;
     let (_, _, first) = call(&f.app, "/api/admin/users/me/", Some(&session(&h))).await;
-    f.profile("stable-external", "external@example.net", None);
+    f.profile(
+        "stable-external",
+        "external@example.net",
+        Some("example.net"),
+    );
     let (state, code, cookie) = f.start(&f.app).await;
     let (_, h, _) = call(&f.app, &callback(&state, &code), Some(&cookie)).await;
     let (_, _, second) = call(&f.app, "/api/admin/users/me/", Some(&session(&h))).await;
@@ -436,7 +461,15 @@ async fn google_sign_in_sets_a_missing_profile_photo_from_a_google_host_only() {
     let sign_in = |subject: &str, email: &str, picture: Value| {
         f.broker.lock().unwrap().profile = json!({"provider":"google","sub":subject,"email":email,"email_verified":true,"name":"Google Viewer","picture":picture});
     };
-    // A new person: the photo Google shows for them becomes theirs.
+    for email in [
+        "photo@gmail.com",
+        "plain@gmail.com",
+        "elsewhere@gmail.com",
+        "none@gmail.com",
+    ] {
+        f.invite(email).await;
+    }
+    // A person signing in for the first time: the photo Google shows for them becomes theirs.
     sign_in("photo-one", "photo@gmail.com", json!(photo));
     let (state, code, cookie) = f.start(&f.app).await;
     let (_, h, _) = call(&f.app, &callback(&state, &code), Some(&cookie)).await;

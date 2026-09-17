@@ -725,7 +725,7 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
     assert_eq!(admin_role["permissions"]["dashboards"]["create"], true);
     assert_eq!(
         admin_role["permissions"]["users"],
-        json!({"list":true,"read":true,"update":true})
+        json!({"list":true,"read":true,"create":true,"update":true})
     );
     // Relations are described the way the admin renders them: as one/many with the related resource.
     let (_, meta) = request(
@@ -1221,9 +1221,98 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         "existing roles are the choices for a user's roles"
     );
     assert_eq!(
+        meta["resources"]["users"]["fields"]["email"]["read_only"], true,
+        "without users.create the email cannot be set"
+    );
+    // Adding people is how they come to sign in. This manager may not; the
+    // owner may, and sets the address once with the roles the person holds.
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/admin/users/",
+            auditor_cookie,
+            json!({"email":"newcomer@example.org"})
+        )
+        .await
+        .0,
+        403
+    );
+    let (_, meta) = request(&app, "OPTIONS", "/api/admin/", owner_cookie, Value::Null).await;
+    assert_eq!(meta["resources"]["users"]["permissions"]["create"], true);
+    assert_eq!(
         meta["resources"]["users"]["fields"]["email"]["read_only"],
+        false
+    );
+    assert_eq!(
+        meta["resources"]["users"]["fields"]["email"]["required"],
         true
     );
+    assert_eq!(
+        meta["resources"]["users"]["permissions"]["fields"]["email"]["write"],
+        json!({"create":true,"update":false}),
+        "the email is set when a person is added and never edited afterwards"
+    );
+    for (body, status, message) in [
+        (
+            json!({"email":"not-an-address"}),
+            400,
+            "Enter a valid email address.",
+        ),
+        (
+            json!({"name":"No address"}),
+            400,
+            "Enter a valid email address.",
+        ),
+        (
+            json!({"email":"newcomer@example.org","roles":["not-a-role"]}),
+            400,
+            "Roles must be a list of role ids.",
+        ),
+    ] {
+        let (code, reply) = request(&app, "POST", "/api/admin/users/", owner_cookie, body).await;
+        assert_eq!(code, status, "{reply}");
+        assert!(reply.to_string().contains(message), "{reply}");
+    }
+    let (status, newcomer) = request(
+        &app,
+        "POST",
+        "/api/admin/users/",
+        owner_cookie,
+        json!({"name":"New Comer","email":"Newcomer@Example.org","roles":[role]}),
+    )
+    .await;
+    assert_eq!(status, 201, "{newcomer}");
+    assert_eq!(newcomer["user"]["email"], "newcomer@example.org");
+    assert_eq!(newcomer["user"]["name"], "New Comer");
+    assert_eq!(newcomer["user"]["roles"], json!([role]));
+    let (status, duplicate) = request(
+        &app,
+        "POST",
+        "/api/admin/users/",
+        owner_cookie,
+        json!({"email":"NEWCOMER@example.org"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{duplicate}");
+    assert!(
+        duplicate.to_string().contains("already exists"),
+        "{duplicate}"
+    );
+    let (status, defaulted) = request(
+        &app,
+        "POST",
+        "/api/admin/users/",
+        owner_cookie,
+        json!({"email":"quiet@example.org"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{defaulted}");
+    assert_eq!(
+        defaulted["user"]["name"], "quiet@example.org",
+        "the name defaults to the address"
+    );
+    assert_eq!(defaulted["user"]["roles"], json!([]));
     assert_eq!(
         request(
             &app,
@@ -1258,7 +1347,8 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         )
         .await
         .0,
-        405
+        403,
+        "adding people takes users.create, which this manager lacks"
     );
     assert_eq!(
         request(

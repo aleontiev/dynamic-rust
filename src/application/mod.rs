@@ -232,13 +232,26 @@ fn section(kind: &str) -> &'static str {
         _ => "Core",
     }
 }
-/// Which built-in fields a person may write, given what their roles grant.
+/// Which built-in fields a person may change on an existing record, given what
+/// their roles grant.
 fn writable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
     match (kind, field) {
         ("roles", "name" | "permissions") => actor.granted("roles", "update"),
         ("users", "name" | "roles") => actor.granted("users", "update"),
         ("dashboards", "name" | "data") | ("views", "name" | "resource" | "data") => {
             actor.granted(kind, "update")
+        }
+        _ => false,
+    }
+}
+/// Which built-in fields a person may set when adding a record. A user's email
+/// is set once, when an administrator adds them; it then belongs to sign-in.
+fn creatable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
+    match (kind, field) {
+        ("users", "name" | "email" | "roles") => actor.granted("users", "create"),
+        ("roles", "name" | "permissions") => actor.granted("roles", "create"),
+        ("dashboards", "name" | "data") | ("views", "name" | "resource" | "data") => {
+            actor.granted(kind, "create")
         }
         _ => false,
     }
@@ -250,7 +263,7 @@ pub(crate) fn core_supports(kind: &str, operation: &str) -> bool {
         (
             "roles" | "dashboards" | "views",
             "create" | "update" | "delete"
-        ) | ("users", "update")
+        ) | ("users", "create" | "update")
     )
 }
 /// The roles that exist, as choices for a user's `roles` field.
@@ -278,7 +291,10 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
     };
     let fields:Map<String,Value>=fields(kind).into_iter().map(|(name,typ)|{
         let write=writable(kind,name,actor);
-        let mut field=json!({"name":name,"label":crate::python_title(&name.replace('_'," ")),"type":typ,"read_only":!write,"required":name=="name" && write,"nullable":!write,"null":!write,"many":typ=="relation","ui":true,"hidden":false,"deferred":false,"sortable":filterable(kind,name),"filterable":filterable(kind,name)});
+        let create=creatable(kind,name,actor);
+        let editable=write||create;
+        let required=editable && (name=="name" || (kind=="users" && name=="email"));
+        let mut field=json!({"name":name,"label":crate::python_title(&name.replace('_'," ")),"type":typ,"read_only":!editable,"required":required,"nullable":!editable,"null":!editable,"many":typ=="relation","ui":true,"hidden":false,"deferred":false,"sortable":filterable(kind,name),"filterable":filterable(kind,name)});
         match (kind,name) {
             ("users","roles")=>{
                 field["related_resource"]=json!("roles");
@@ -297,9 +313,10 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
         .keys()
         .map(|name| {
             let write = writable(kind, name, actor);
+            let create = creatable(kind, name, actor);
             (
                 name.clone(),
-                json!({"read":true,"create":write,"write":write}),
+                json!({"read":true,"create":create,"write":{"create":create,"update":write}}),
             )
         })
         .collect();

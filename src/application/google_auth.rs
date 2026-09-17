@@ -294,6 +294,9 @@ pub(super) async fn callback(
         if existing.is_some() && !authoritative {
             return failure(&app, "email_link");
         }
+        if existing.is_none() && !super::core::member(&app, &mut tx, &email).await? {
+            return failure(&app, "no_account");
+        }
         let id = existing.unwrap_or_else(Uuid::new_v4);
         if existing.is_none() {
             let name = if identity.name.trim().is_empty() {

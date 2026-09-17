@@ -29,6 +29,18 @@ fn digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
+/// Addresses an administrator added, so they may request sign-in links.
+const INVITED: [&str; 9] = [
+    "new-person@example.org",
+    "a@example.org",
+    "delivery-failure@example.org",
+    "expired@example.org",
+    "next-page@example.org",
+    "next-elsewhere@example.org",
+    "rate@example.org",
+    "other@example.org",
+    "leak@example.org",
+];
 struct Fixture {
     admin: PgPool,
     pool: PgPool,
@@ -84,6 +96,16 @@ impl Fixture {
             .unwrap();
         let token = Uuid::new_v4().to_string();
         sqlx::query("INSERT INTO app_sessions(digest,user_id,expires) VALUES($1,$2,now()+interval '1 hour')").bind(digest(&token)).bind(user).execute(&pool).await.unwrap();
+        // Sign-in is for people an administrator added (and the superusers);
+        // these are the addresses the tests sign in with.
+        for email in INVITED {
+            sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'users',$2)")
+                .bind(Uuid::new_v4())
+                .bind(json!({"name":email,"email":email,"data":{}}))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         let mail = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let received = mail.clone();
         let mail_router = Router::new().route(
@@ -294,13 +316,39 @@ async fn magic_link_delivery_confirmation_replay_and_logout() {
     assert_ne!(stored, token);
     assert_eq!(stored_email, email);
     assert_eq!(lifetime, 900);
+    let seeded = 1 + i64::try_from(INVITED.len()).unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM app_records WHERE kind='users'")
             .fetch_one(&f.pool)
             .await
             .unwrap(),
-        1,
+        seeded,
         "requesting a link must not create a user"
+    );
+    // A stranger gets no link: sign-in is for the people an administrator added.
+    let (status, _, reply) = post(
+        &f.app,
+        "/api/auth/magic-link",
+        json!({"email":"stranger@example.org"}),
+        Some("https://dummy.example.org"),
+    )
+    .await;
+    assert_eq!(status, 403, "{reply}");
+    assert_eq!(
+        reply["detail"],
+        "There is no account for this email address. Ask an administrator of this app to add you."
+    );
+    assert_eq!(
+        f.mail.lock().unwrap().len(),
+        1,
+        "no link is sent to a stranger"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM app_magic_links")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap(),
+        1
     );
     assert_eq!(
         call(
@@ -571,7 +619,7 @@ async fn magic_link_expiry_failure_and_existing_user() {
             .fetch_one(&f.pool)
             .await
             .unwrap(),
-        1
+        1 + i64::try_from(INVITED.len()).unwrap()
     );
     assert_eq!(
         call(
@@ -693,7 +741,10 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             },
             "unexpected navigation section for {kind}"
         );
-        assert_eq!(schema["permissions"]["fields"]["name"]["write"], false);
+        assert_eq!(
+            schema["permissions"]["fields"]["name"]["write"],
+            json!({"create":false,"update":false})
+        );
         assert_eq!(
             call(
                 &f.app,
@@ -705,8 +756,8 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             .0,
             200
         );
-        // Roles, dashboards and views can be created by people whose roles allow
-        // it; this viewer's cannot. Every other built-in resource is read-only.
+        // Roles, dashboards, views and users can be created by people whose roles
+        // allow it; this viewer's cannot. Every other built-in resource is read-only.
         assert_eq!(
             call(
                 &f.app,
@@ -716,7 +767,7 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             )
             .await
             .0,
-            if matches!(kind, "roles" | "dashboards" | "views") {
+            if matches!(kind, "roles" | "dashboards" | "views" | "users") {
                 403
             } else {
                 405

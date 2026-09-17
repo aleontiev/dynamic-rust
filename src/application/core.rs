@@ -1,5 +1,6 @@
-//! Writes to the built-in resources people administer: roles, and the roles a
-//! user holds. Everything else built in stays read-only through the API.
+//! Writes to the built-in resources people administer: roles, and the users
+//! who may sign in and the roles they hold. Everything else built in stays
+//! read-only through the API.
 //!
 //! Superusers may always manage roles and users; anyone else needs a held
 //! role whose access map grants the operation on `roles` or `users`.
@@ -52,6 +53,45 @@ pub(super) async fn write(
         return Err(ApiError::Parse("Expected a JSON object.".into()));
     }
     let record = match (kind, operation) {
+        ("users", "create") => {
+            // Adding a person is how they come to be able to sign in.
+            let email = input
+                .get("email")
+                .and_then(Value::as_str)
+                .map(super::magic_auth::email)
+                .transpose()
+                .map_err(|_| invalid("email", "Enter a valid email address."))?
+                .ok_or_else(|| invalid("email", "Enter a valid email address."))?;
+            let taken: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM app_records WHERE kind='users' AND lower(data->>'email')=$1)")
+                .bind(&email).fetch_one(&mut *connection).await.map_err(ApiError::internal)?;
+            if taken {
+                return Err(invalid(
+                    "email",
+                    "A user with this email address already exists.",
+                ));
+            }
+            let name = input
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or(&email);
+            if name.chars().count() > 200 {
+                return Err(invalid("name", "Name must be 1 to 200 characters."));
+            }
+            let roles = match input.get("roles") {
+                Some(roles) => role_ids(connection, roles).await?,
+                None => vec![],
+            };
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'users',$2)")
+                .bind(id)
+                .bind(json!({"name":name,"email":email,"data":{"roles":roles}}))
+                .execute(&mut *connection)
+                .await
+                .map_err(ApiError::internal)?;
+            fetch(connection, kind, id).await?
+        }
         ("roles", "create") => {
             let id = Uuid::new_v4();
             let data = role_data(app, connection, id, &json!({"permissions":{}}), &input).await?;
@@ -256,7 +296,7 @@ pub(crate) fn admin_access_map(app_models: impl Iterator<Item = String>) -> Valu
             kind.into(),
             match kind {
                 "roles" | "dashboards" | "views" => all.clone(),
-                "users" => json!({"list":true,"read":true,"update":true}),
+                "users" => json!({"list":true,"read":true,"create":true,"update":true}),
                 _ => json!({"list":true,"read":true}),
             },
         );
@@ -289,6 +329,28 @@ pub async fn ensure_admin_role(
         .await
         .map_err(ApiError::internal)?;
     Ok(id)
+}
+
+/// Whether an email address may sign in: the app's superusers always may, and
+/// so may anyone an administrator has added as a user. Sign-in never creates
+/// an account for anyone else, so a stranger who knows the app's address gets
+/// no further than the sign-in page.
+pub(crate) async fn member(
+    app: &App,
+    connection: &mut PgConnection,
+    email: &str,
+) -> Result<bool, ApiError> {
+    let email = email.trim().to_ascii_lowercase();
+    if app.superusers.contains(&email) {
+        return Ok(true);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM app_records WHERE kind='users' AND lower(data->>'email')=$1)",
+    )
+    .bind(&email)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(ApiError::internal)
 }
 
 /// Give a signing-in superuser the Admin role, so the owner's own record shows

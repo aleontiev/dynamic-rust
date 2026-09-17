@@ -232,6 +232,14 @@ pub(super) async fn request_link(
         .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
+    if !super::core::member(&app, &mut tx, &email).await? {
+        // The attempt still counts against the limits above.
+        tx.commit().await.map_err(ApiError::internal)?;
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            json!({"detail":"There is no account for this email address. Ask an administrator of this app to add you."}),
+        ));
+    }
     sqlx::query("INSERT INTO app_magic_links(digest,email,expires) VALUES($1,$2,now()+interval '15 minutes')").bind(&token_digest).bind(&email).execute(&mut *tx).await.map_err(ApiError::internal)?;
     tx.commit().await.map_err(ApiError::internal)?;
     let link = format!(
