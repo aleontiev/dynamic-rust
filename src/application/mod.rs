@@ -574,9 +574,8 @@ async fn retrieve(
         return Err(ApiError::NotFound);
     }
     // A person may always read their own record; anything else takes a grant.
-    if !app.actor(&person).await?.core_readable(&kind)
-        && !(kind == "users" && person["id"].as_str() == Some(&id.to_string()))
-    {
+    let own = kind == "users" && person["id"].as_str() == Some(&id.to_string());
+    if !own && !app.actor(&person).await?.core_readable(&kind) {
         return Err(ApiError::Forbidden);
     }
     let record = sqlx::query_scalar(&format!(
