@@ -69,6 +69,7 @@ impl App {
         let mut actor = extensions::Actor::for_user(user, &self.superusers);
         let ids = extensions::Actor::role_ids(user);
         if ids.is_empty() {
+            actor.admit();
             return Ok(actor);
         }
         let roles: Vec<(String, Value)> = sqlx::query_as(
@@ -84,6 +85,7 @@ impl App {
             let access = crate::parse_access_map(&permissions, &targets).unwrap_or_default();
             actor.hold(&name, access);
         }
+        actor.admit();
         Ok(actor)
     }
     /// What a role's access map may name: registered models with their fields,
@@ -309,6 +311,7 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
         }
         (name.into(),field)
     }).collect();
+    let readable = actor.core_readable(kind);
     let permissions: Map<String, Value> = fields
         .keys()
         .map(|name| {
@@ -331,7 +334,7 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
             )
         })
         .collect();
-    json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":crate::python_title(&kind.replace('_'," ")),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":section(kind),"fields":fields,"permissions":{"list":true,"read":true,"create":operations["create"],"update":operations["update"],"delete":operations["delete"],"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]})
+    json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":crate::python_title(&kind.replace('_'," ")),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":section(kind),"fields":fields,"permissions":{"list":readable,"read":readable,"create":operations["create"],"update":operations["update"],"delete":operations["delete"],"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]})
 }
 /// Built-in fields the list endpoint can filter and sort by.
 fn filterable(kind: &str, field: &str) -> bool {
@@ -375,6 +378,7 @@ async fn metadata(State(app): State<App>, headers: HeaderMap) -> Result<Json<Val
     let roles = role_choices(&app).await?;
     let mut resources: Map<String, Value> = KINDS
         .iter()
+        .filter(|k| actor.core_readable(k))
         .map(|k| ((*k).to_string(), schema(&app, k, &actor, &roles)))
         .collect();
     for (name, model) in &app.registry.models {
@@ -389,8 +393,10 @@ async fn metadata(State(app): State<App>, headers: HeaderMap) -> Result<Json<Val
             );
         }
     }
+    // Someone without a role sees no resources; the admin tells them to ask an
+    // administrator for one rather than showing an empty app.
     Ok(Json(
-        json!({"type":"namespace","name":"app","label":app.name,"resources":resources}),
+        json!({"type":"namespace","name":"app","label":app.name,"resources":resources,"access":if actor.is_member() {"member"} else {"none"}}),
     ))
 }
 async fn options(
@@ -411,6 +417,9 @@ async fn options(
     }
     if !KINDS.contains(&kind.as_str()) {
         return Err(ApiError::NotFound);
+    }
+    if !actor.core_readable(&kind) {
+        return Err(ApiError::Forbidden);
     }
     Ok(Json(schema(
         &app,
@@ -492,7 +501,7 @@ async fn list(
     Path(kind): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<ApiDocument>, ApiError> {
-    user(&app, &headers).await?;
+    let person = user(&app, &headers).await?;
     if app.registry.models.contains_key(&kind) {
         return extension_api::list(app, headers, kind, raw).await;
     }
@@ -506,6 +515,9 @@ async fn list(
     }
     if !KINDS.contains(&kind.as_str()) {
         return Err(ApiError::NotFound);
+    }
+    if !app.actor(&person).await?.core_readable(&kind) {
+        return Err(ApiError::Forbidden);
     }
     let features = QueryFeatures::parse(raw.as_deref().unwrap_or(""), 10000)?;
     let mut count = QueryBuilder::<Postgres>::new("SELECT count(*)");
@@ -554,12 +566,18 @@ async fn retrieve(
     Path((kind, id)): Path<(String, Uuid)>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<ApiDocument>, ApiError> {
-    user(&app, &headers).await?;
+    let person = user(&app, &headers).await?;
     if app.registry.models.contains_key(&kind) {
         return extension_api::retrieve(app, headers, kind, id, raw).await;
     }
     if !KINDS.contains(&kind.as_str()) {
         return Err(ApiError::NotFound);
+    }
+    // A person may always read their own record; anything else takes a grant.
+    if !app.actor(&person).await?.core_readable(&kind)
+        && !(kind == "users" && person["id"].as_str() == Some(&id.to_string()))
+    {
+        return Err(ApiError::Forbidden);
     }
     let record = sqlx::query_scalar(&format!(
         "SELECT {DOCUMENT} FROM app_records WHERE kind=$1 AND id=$2"

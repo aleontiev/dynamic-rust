@@ -34,11 +34,10 @@ impl Actor {
     /// role entries that are not record ids are taken as role names, which is
     /// how applications assigned roles before roles became records.
     pub fn from_user(user: &Value) -> Self {
-        let mut roles: BTreeSet<String> = stored_roles(user)
+        let roles: BTreeSet<String> = stored_roles(user)
             .filter(|role| Uuid::parse_str(role).is_err())
             .map(str::to_owned)
             .collect();
-        roles.insert("authenticated".into());
         Self {
             id: user["id"].as_str().unwrap_or_default().into(),
             roles,
@@ -59,6 +58,29 @@ impl Actor {
         self.roles.insert(name.into());
         self.access.insert(name.into(), access);
     }
+    /// Whether this person is a member of the app: a superuser, or someone
+    /// holding at least one role. Only members carry the implicit
+    /// `authenticated` role, so a person with no role reaches nothing.
+    #[must_use]
+    pub fn is_member(&self) -> bool {
+        self.is_superuser || self.roles.iter().any(|role| role != "authenticated")
+    }
+    /// Give a member the implicit `authenticated` role; called once the stored
+    /// roles are known.
+    pub fn admit(&mut self) {
+        if self.is_member() {
+            self.roles.insert("authenticated".into());
+        }
+    }
+    /// Whether this person may read a built-in resource. Superusers may; other
+    /// members read the admin's own pages (dashboards and views) and whatever
+    /// their roles grant; people without a role read nothing.
+    #[must_use]
+    pub fn core_readable(&self, kind: &str) -> bool {
+        self.is_superuser
+            || (self.is_member()
+                && (matches!(kind, "dashboards" | "views") || self.granted(kind, "list")))
+    }
     /// Whether a held role grants an operation on a resource unconditionally.
     /// Built-in resources have no row filters, so this is their whole answer.
     #[must_use]
@@ -78,6 +100,7 @@ impl Actor {
         actor.is_superuser = user["email"]
             .as_str()
             .is_some_and(|email| superusers.contains(&email.trim().to_ascii_lowercase()));
+        actor.admit();
         actor
     }
     #[must_use]

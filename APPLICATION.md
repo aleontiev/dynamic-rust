@@ -37,6 +37,16 @@ unknown address ends on the sign-in page with the same advice; no account is
 ever created by signing in. The email is set once, when the person is added,
 and is read-only afterwards. So `authenticated` means every member of the app,
 never the public.
+
+Holding a role is what makes someone a member: the superusers and anyone with
+at least one role. A signed-in person with no role carries no `authenticated`
+role either, so they reach nothing — `OPTIONS /api/admin/` answers
+`"access": "none"` with no resources, every list and schema request is
+refused, and only their own user record and `/api/admin/users/me/` answer —
+and the admin shows them a page saying to ask an administrator for a role.
+Built-in resources follow the same rule: a member reads dashboards and views
+(the admin's own pages) and whatever their roles grant (`users`, `roles`,
+`providers`, `identities`, `identity_verifications`), and nothing else.
 `Model.resource` exposes Dynamic Rust's metadata, role grants, per-role field
 overrides, list columns and row filters. Row filters support boolean groups and
 exact comparisons, including `$user.id`. A role granted an operation without a

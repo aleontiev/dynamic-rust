@@ -87,10 +87,19 @@ impl Fixture {
             .execute(&pool)
             .await
             .unwrap();
+        // The viewer holds a role that reads every built-in resource and writes
+        // none; a person without a role would reach nothing at all.
+        let viewer_role = Uuid::new_v4();
+        sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'roles',$2)")
+            .bind(viewer_role)
+            .bind(json!({"name":"Viewer","permissions":{"users":{"list":true,"read":true},"identities":{"list":true,"read":true},"identity_verifications":{"list":true,"read":true},"roles":{"list":true,"read":true},"dashboards":{"list":true,"read":true},"views":{"list":true,"read":true},"providers":{"list":true,"read":true}}}))
+            .execute(&pool)
+            .await
+            .unwrap();
         let user = Uuid::new_v4();
         sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'users',$2)")
             .bind(user)
-            .bind(json!({"name":"Viewer","email":"viewer@example.org","data":{}}))
+            .bind(json!({"name":"Viewer","email":"viewer@example.org","data":{"roles":[viewer_role]}}))
             .execute(&pool)
             .await
             .unwrap();
@@ -403,11 +412,68 @@ async fn magic_link_delivery_confirmation_replay_and_logout() {
     assert_eq!(me["user"]["email"], email);
     let id = me["user"]["id"].as_str().unwrap();
     for kind in ["identities", "identity_verifications"] {
-        let (_, _, records) =
-            call(&f.app, "GET", &format!("/api/admin/{kind}/"), Some(cookie)).await;
-        assert_eq!(records[kind].as_array().unwrap().len(), 1);
-        assert_eq!(records[kind][0]["user"], id);
+        let linked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM app_records WHERE kind=$1 AND data->>'user'=$2",
+        )
+        .bind(kind)
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(linked, 1, "{kind}");
     }
+    // Signed in but holding no role, this person reaches nothing: no resources
+    // in the schema, no lists, no other records — only their own record.
+    let (status, _, metadata) = call(&f.app, "OPTIONS", "/api/admin/", Some(cookie)).await;
+    assert_eq!(status, 200);
+    assert_eq!(metadata["access"], "none");
+    assert_eq!(metadata["resources"].as_object().unwrap().len(), 0);
+    for kind in CORE {
+        assert_eq!(
+            call(&f.app, "GET", &format!("/api/admin/{kind}/"), Some(cookie))
+                .await
+                .0,
+            403,
+            "{kind}"
+        );
+        assert_eq!(
+            call(
+                &f.app,
+                "OPTIONS",
+                &format!("/api/admin/{kind}/"),
+                Some(cookie)
+            )
+            .await
+            .0,
+            403,
+            "{kind}"
+        );
+    }
+    assert_eq!(
+        call(
+            &f.app,
+            "GET",
+            &format!("/api/admin/users/{id}/"),
+            Some(cookie)
+        )
+        .await
+        .0,
+        200,
+        "a person may read their own record"
+    );
+    assert_eq!(
+        call(
+            &f.app,
+            "GET",
+            &format!("/api/admin/users/{}/", f.user),
+            Some(cookie)
+        )
+        .await
+        .0,
+        403
+    );
+    let (_, _, viewer_metadata) = call(&f.app, "OPTIONS", "/api/admin/", Some(&f.cookie)).await;
+    assert_eq!(viewer_metadata["access"], "member");
     let session = cookie.split_once('=').unwrap().1;
     let remaining: i64 = sqlx::query_scalar(
         "SELECT extract(epoch FROM(expires-now()))::bigint FROM app_sessions WHERE digest=$1",
@@ -886,8 +952,11 @@ async fn core_runtime_lists_filter_projection_counts_and_resource_boundaries() {
     .await;
     assert_eq!(status, 200, "{page}");
     assert_eq!(page["roles"][0]["id"], b.to_string());
-    assert_eq!(page["meta"]["total_results"], 3);
-    assert_eq!(page["meta"]["total_pages"], 3);
+    assert_eq!(
+        page["meta"]["total_results"], 4,
+        "three made here and the viewer's own"
+    );
+    assert_eq!(page["meta"]["total_pages"], 4);
     let (_, _, filtered) = call(
         &f.app,
         "GET",
@@ -956,7 +1025,7 @@ async fn core_runtime_lists_filter_projection_counts_and_resource_boundaries() {
     )
     .await;
     assert_eq!(empty["roles"], json!([]));
-    assert_eq!(empty["meta"]["total_results"], 3);
+    assert_eq!(empty["meta"]["total_results"], 4);
     let (status, _, one) = call(
         &f.app,
         "GET",

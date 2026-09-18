@@ -506,7 +506,11 @@ async fn google_sign_in_sets_a_missing_profile_photo_from_a_google_host_only() {
         assert_eq!(me["user"]["email"], email);
         assert!(me["user"]["photo"].is_null(), "{email}");
     }
-    // The schema lists the photo as a read-only image the admin can show.
+    // The schema lists the photo as a read-only image the admin can show
+    // (read by a superuser: someone without a role is shown no schema).
+    sign_in("google-subject-one", "viewer@gmail.com", Value::Null);
+    let (state, code, cookie) = f.start(&f.app).await;
+    let (_, h, _) = call(&f.app, &callback(&state, &code), Some(&cookie)).await;
     let request = Request::builder()
         .method("OPTIONS")
         .uri("/api/admin/users/")

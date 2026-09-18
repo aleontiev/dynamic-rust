@@ -28,8 +28,11 @@
   if(location.pathname==='/api/preview/auth'){
     const params=new URLSearchParams(location.hash.slice(1));history.replaceState(null,'',location.pathname);
     if(!window.opener || !/^[a-f0-9]{64}$/.test(params.get('nonce')||''))return;
-    sessionStorage.setItem(key,JSON.stringify({nonce:params.get('nonce'),method:params.get('method'),email:params.get('email')||'',started:Date.now()}));
-    location.replace('/api/login/');return;
+    // Google goes straight to the account picker; an email link needs the
+    // sign-in page to send it, so that request is replayed there.
+    const google=params.get('method')==='google';
+    sessionStorage.setItem(key,JSON.stringify({nonce:params.get('nonce'),method:google?'':params.get('method'),email:params.get('email')||'',started:Date.now()}));
+    location.replace(google?'/api/auth/google':'/api/login/');return;
   }
   const request=read();
   if(location.pathname==='/api/preview/finish'){

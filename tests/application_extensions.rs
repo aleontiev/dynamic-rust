@@ -759,7 +759,7 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
     );
     assert_eq!(meta["permissions"]["create"], true);
     assert_eq!(meta["fields"]["name"]["read_only"], false);
-    let (_, meta) = request(
+    let (status, _) = request(
         &app,
         "OPTIONS",
         "/api/admin/roles/",
@@ -767,8 +767,10 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         Value::Null,
     )
     .await;
-    assert_eq!(meta["permissions"]["create"], false);
-    assert_eq!(meta["fields"]["name"]["read_only"], true);
+    assert_eq!(
+        status, 403,
+        "without a role there is nothing to see, not even a schema"
+    );
 
     // Only people whose roles allow it manage roles; maps are validated on save.
     let permissions = json!({
@@ -1187,9 +1189,12 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
     let (_, meta) = request(&app, "OPTIONS", "/api/admin/", clerk_cookie, Value::Null).await;
     assert_eq!(meta["resources"]["orders"]["permissions"]["create"], false);
     assert!(
-        meta["resources"]["users"]["permissions"]["list"]
-            .as_bool()
-            .unwrap()
+        meta["resources"]["users"].is_null(),
+        "a built-in resource shows only to roles that grant it: {meta}"
+    );
+    assert_eq!(
+        meta["resources"]["views"]["permissions"]["list"], true,
+        "the admin's own pages are readable by every member"
     );
 
     // A role that manages roles and users delegates administration.
