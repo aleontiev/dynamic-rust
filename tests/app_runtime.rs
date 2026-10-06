@@ -1617,3 +1617,61 @@ async fn legacy_admin_defaults_are_repaired_once_and_custom_permissions_are_pres
     assert_eq!(saved["role"]["permissions"], custom);
     f.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn a_role_naming_what_the_app_dropped_keeps_the_rest_of_its_access() {
+    let secret = "stale-admin-test-secret-0123456789ab";
+    let f = Fixture::configure(false, Some(secret)).await;
+    let owner = owner_session(&f, secret).await;
+    let (_, _, roles) = call(&f.app, "GET", "/api/admin/roles/", Some(&owner)).await;
+    let role_id = roles["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|role| role["name"] == "Admin")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    sqlx::query("UPDATE app_records SET data=jsonb_set(data,'{data,roles}',$2) WHERE id=$1")
+        .bind(f.user)
+        .bind(json!([role_id]))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    // A release removed a resource and an action the stored Admin map still names.
+    sqlx::query("UPDATE app_records SET data=jsonb_set(jsonb_set(jsonb_set(data,'{permissions,ghosts}','{\"list\":true}'),'{permissions,roles,record_payment}','true'),'{admin_known}',data->'admin_known'||'[\"ghosts\",\"roles.record_payment\"]') WHERE id=$1::uuid")
+        .bind(&role_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let (status, _, listed) = call(&f.app, "GET", "/api/admin/roles/", Some(&f.cookie)).await;
+    assert_eq!(
+        status, 200,
+        "the rest of the Admin map still applies: {listed}"
+    );
+    // The next time the Admin role is ensured, what's gone leaves its map.
+    owner_session(&f, secret).await;
+    let data: Value = sqlx::query_scalar("SELECT data FROM app_records WHERE id=$1::uuid")
+        .bind(&role_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert!(data["permissions"].get("ghosts").is_none(), "{data}");
+    assert!(
+        data["permissions"]["roles"].get("record_payment").is_none(),
+        "{data}"
+    );
+    assert_eq!(data["permissions"]["roles"]["list"], true);
+    let known: Vec<&str> = data["admin_known"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        !known.contains(&"ghosts") && !known.contains(&"roles.record_payment"),
+        "{known:?}"
+    );
+}

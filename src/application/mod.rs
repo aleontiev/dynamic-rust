@@ -86,9 +86,9 @@ impl App {
         let targets = self.access_targets();
         let actions = self.registry.action_targets();
         for (name, permissions) in roles {
-            // Maps are validated when saved; anything unreadable grants nothing.
-            let access = crate::parse_access_map_with_actions(&permissions, &targets, &actions)
-                .unwrap_or_default();
+            // Maps are validated when saved, but the app may since have dropped a
+            // resource or action one names: only that entry grants nothing.
+            let access = crate::parse_stored_access_map(&permissions, &targets, &actions);
             actor.hold(&name, access);
         }
         actor.admit();

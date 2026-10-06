@@ -180,6 +180,44 @@ pub fn parse_access_map_with_actions(
     Ok(map)
 }
 
+/// Read a stored access map for a request. Unlike [`parse_access_map_with_actions`],
+/// which validates a map being saved, nothing here voids the whole map: a
+/// resource or action the app no longer has, or an unreadable rule, grants
+/// nothing, and every other rule still applies. A role saved before a release
+/// removed an action keeps the rest of its access.
+#[must_use]
+pub fn parse_stored_access_map(
+    value: &Value,
+    targets: &AccessTargets,
+    actions: &ActionTargets,
+) -> AccessMap {
+    let mut map = AccessMap::new();
+    for (resource, rules) in value.as_object().into_iter().flatten() {
+        let (Some(fields), Some(rules)) = (targets.get(resource), rules.as_object()) else {
+            continue;
+        };
+        let parsed: AccessRules = rules
+            .iter()
+            .filter(|(operation, _)| {
+                OPERATIONS.contains(&operation.as_str())
+                    || actions
+                        .get(resource)
+                        .is_some_and(|names| names.contains(*operation))
+            })
+            .filter_map(|(operation, rule)| {
+                parse_rule(rule, fields.as_ref())
+                    .ok()
+                    .flatten()
+                    .map(|filter| (operation.clone(), filter))
+            })
+            .collect();
+        if !parsed.is_empty() {
+            map.insert(resource.clone(), parsed);
+        }
+    }
+    map
+}
+
 /// Whether a record meets a rule, with `actor_id` standing in for `$user.id`.
 #[must_use]
 pub fn filter_matches(filter: &PermissionFilter, record: &Value, actor_id: &str) -> bool {

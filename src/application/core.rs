@@ -469,6 +469,27 @@ pub async fn ensure_admin_role(
         }
         data["admin_known"] = json!(known);
     }
+    // What the app no longer has can't be granted: drop it, so the map stays
+    // valid (and can be saved again from Roles), and grant it afresh should it
+    // come back.
+    if let Some(permissions) = data["permissions"].as_object_mut() {
+        permissions.retain(|model, _| targets.contains(model));
+        for (model, rules) in permissions.iter_mut() {
+            if let Some(rules) = rules.as_object_mut() {
+                rules.retain(|operation, _| {
+                    crate::ACCESS_OPERATIONS.contains(&operation.as_str())
+                        || targets.contains(&format!("{model}.{operation}"))
+                });
+            }
+        }
+    }
+    if let Some(known) = data["admin_known"].as_array_mut() {
+        known.retain(|target| {
+            target
+                .as_str()
+                .is_some_and(|target| targets.contains(target))
+        });
+    }
     data["managed"] = json!(true);
     if data != before {
         sqlx::query("UPDATE app_records SET data=$2,updated=now() WHERE kind='roles' AND id=$1")
