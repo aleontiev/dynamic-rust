@@ -300,6 +300,7 @@ async fn role_data(
         "description",
         "admin_defaults_version",
         "admin_known",
+        "default_permissions",
     ] {
         if let Some(value) = current.get(key) {
             record[key] = value.clone();
@@ -478,6 +479,63 @@ pub async fn ensure_admin_role(
             .map_err(ApiError::internal)?;
     }
     Ok(id)
+}
+
+/// Create the roles the app ships with ([`Registry::role`]) and keep their
+/// maps in step with the code while nobody has changed them. Each record keeps
+/// the defaults it was last given, which is how a change is recognised.
+///
+/// # Errors
+/// Rejects maps that name unknown resources, fields, operations or actions.
+pub async fn ensure_roles(
+    connection: &mut PgConnection,
+    registry: &super::extensions::Registry,
+) -> Result<(), ApiError> {
+    let mut targets = registry.access_targets();
+    for kind in super::KINDS {
+        targets.insert(kind.into(), None);
+    }
+    let actions = registry.action_targets();
+    for (name, permissions) in &registry.roles {
+        crate::parse_access_map_with_actions(permissions, &targets, &actions)
+            .map_err(|message| ApiError::Parse(format!("Role {name}: {message}")))?;
+        let existing: Option<(Uuid, Value)> = sqlx::query_as(
+            "SELECT id,data FROM app_records WHERE kind='roles' AND lower(data->>'name')=lower($1) ORDER BY created,id LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(ApiError::internal)?;
+        match existing {
+            None => {
+                sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'roles',$2)")
+                    .bind(Uuid::new_v4())
+                    .bind(json!({"name":name,"permissions":permissions,"default_permissions":permissions}))
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(ApiError::internal)?;
+            }
+            Some((id, data))
+                if data.get("default_permissions") == data.get("permissions")
+                    && data.get("permissions") != Some(permissions) =>
+            {
+                let mut data = data;
+                data["permissions"] = permissions.clone();
+                data["default_permissions"] = permissions.clone();
+                sqlx::query(
+                    "UPDATE app_records SET data=$2,updated=now() WHERE kind='roles' AND id=$1",
+                )
+                .bind(id)
+                .bind(&data)
+                .execute(&mut *connection)
+                .await
+                .map_err(ApiError::internal)?;
+            }
+            // Changed by an administrator, made by hand, or already current.
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Whether an email address may sign in: the app's superusers always may, and

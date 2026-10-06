@@ -1238,3 +1238,145 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
         .unwrap();
     assert_eq!(written, 1);
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn shipped_roles_are_checked_created_and_keep_an_administrators_changes() {
+    let pool = isolated_pool("shipped_roles").await;
+    let base = "http://127.0.0.1:9";
+    let mut registry = registry(base);
+    for name in ["", "authenticated", "*", "admin", " ADMIN "] {
+        assert!(registry.role(name, json!({})).is_err(), "{name:?}");
+    }
+    assert!(registry.role("Clerk", json!(["orders"])).is_err());
+    let clerk = json!({"orders":{"list":true,"read":true,"approve":{"approver":"$user.id"}}});
+    let auditor = json!({"orders":{"list":true,"read":true}});
+    registry.role("Clerk", clerk.clone()).unwrap();
+    registry.role("Auditor", auditor.clone()).unwrap();
+    assert!(
+        registry.role("clerk", json!({})).is_err(),
+        "names are case-insensitive"
+    );
+    registry.migrate(&pool).await.unwrap();
+    registry.migrate(&pool).await.unwrap();
+    let roles = |pool: PgPool| async move {
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT data->>'name',data->'permissions' FROM app_records WHERE kind='roles' ORDER BY data->>'name'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        rows.into_iter().collect::<BTreeMap<_, _>>()
+    };
+    let saved = roles(pool.clone()).await;
+    assert_eq!(
+        saved.len(),
+        3,
+        "Admin, Auditor and Clerk, once each: {saved:?}"
+    );
+    assert_eq!(saved["Clerk"], clerk);
+    assert_eq!(saved["Auditor"], auditor);
+
+    // An administrator narrows the Auditor role through the API.
+    let owner = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'users',$2)")
+        .bind(owner)
+        .bind(json!({"name":"owner","email":"owner@example.com","data":{"roles":[]}}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    {
+        use sha2::{Digest, Sha256};
+        sqlx::query("INSERT INTO app_sessions(digest,user_id,expires) VALUES($1,$2,now()+interval '1 hour')")
+            .bind(format!("{:x}", Sha256::digest(b"owner-token")))
+            .bind(owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let state = App {
+        pool: pool.clone(),
+        registry: Arc::new(registry),
+        name: "Procurement".into(),
+        origin: "https://example.com".into(),
+        preview_origins: vec![],
+        mail_from: "noreply@example.com".into(),
+        mail_region: "us-east-1".into(),
+        mail_api_key: None,
+        google_auth: None,
+        branding: json!({}),
+        mail_endpoint: None,
+        revision: "test".into(),
+        superusers: dynamic_rust::application::parse_superusers("owner@example.com"),
+        operator_secret: None,
+    };
+    let app = router(state.clone());
+    let (_, listed) = request(
+        &app,
+        "GET",
+        "/api/admin/roles/",
+        "dream_app=owner-token",
+        Value::Null,
+    )
+    .await;
+    let auditor_id = listed["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|role| role["name"] == "Auditor")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!listed.to_string().contains("default_permissions"));
+    let narrowed = json!({"orders":{"list":true}});
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("/api/admin/roles/{auditor_id}/"),
+        "dream_app=owner-token",
+        json!({"permissions":narrowed}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // The next release widens both defaults: the untouched Clerk follows, the
+    // narrowed Auditor keeps the administrator's version.
+    let mut next = registry_with_roles(
+        base,
+        &[
+            (
+                "Clerk",
+                json!({"orders":{"list":true,"read":true,"approve":true,"reject":true}}),
+            ),
+            (
+                "Auditor",
+                json!({"orders":{"list":true,"read":true},"suppliers":{"list":true}}),
+            ),
+        ],
+    );
+    next.migrate(&pool).await.unwrap();
+    let saved = roles(pool.clone()).await;
+    assert_eq!(saved["Clerk"]["orders"]["reject"], true);
+    assert_eq!(saved["Auditor"], narrowed);
+
+    // A map the app's code gets wrong stops the release instead of granting nothing.
+    for wrong in [
+        json!({"invoices":{"list":true}}),
+        json!({"orders":{"ship":true}}),
+        json!({"orders":{"read":{"colour":"red"}}}),
+        json!({"users":{"list":{"name":"x"}}}),
+    ] {
+        next = registry_with_roles(base, &[("Broken", wrong.clone())]);
+        let error = next.migrate(&pool).await.unwrap_err();
+        assert!(error.to_string().contains("Broken"), "{wrong} {error}");
+    }
+}
+
+fn registry_with_roles(service: &str, roles: &[(&str, Value)]) -> Registry {
+    let mut registry = registry(service);
+    for (name, permissions) in roles {
+        registry.role(name, permissions.clone()).unwrap();
+    }
+    registry
+}

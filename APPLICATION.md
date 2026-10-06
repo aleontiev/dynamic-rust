@@ -81,6 +81,24 @@ nothing. Built-in resources take only `true` or `false`. Maps are validated when
 saved; `OPTIONS /api/admin/roles/` lists the resources rules may name under the
 `permissions` field, marking which accept conditions.
 
+An app ships its own roles with `registry.role(name, map)`:
+
+```rust
+registry.role("Approver", json!({
+    "purchase_orders": {"list": {"approver": "$user.id"}, "read": {"approver": "$user.id"},
+                        "approve": {"approver": "$user.id", "state": "submitted"}},
+    "suppliers": {"list": true, "read": true}
+}))?;
+```
+
+`registry.migrate` checks each map against the registered models, fields and
+actions — a mistake fails the app's tests and its start instead of quietly
+granting nothing — and creates the role when no role of that name exists.
+Later releases update a shipped role's map only while it still holds the
+defaults the app gave it; once an administrator changes the role, theirs
+stays. Grants in code for the same name still apply; keep the rules people
+should be able to adjust in the map.
+
 Superusers, and holders of a role whose map grants those operations on `roles`
 and `users`, create, edit and delete roles, add and remove users (removing
 one ends their sessions and sign-in identities; nobody removes themselves), and

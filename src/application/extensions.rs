@@ -375,6 +375,8 @@ pub struct Registry {
     pub actions: BTreeMap<(String, String), Action>,
     pub tasks: BTreeMap<String, Arc<dyn Handler>>,
     pub migrations: BTreeMap<String, String>,
+    /// Roles the app ships with, by name: their default access maps.
+    pub roles: BTreeMap<String, Value>,
     /// Outside services the app connects to, by name; each is a `providers` record.
     pub integrations: BTreeMap<String, Integration>,
 }
@@ -617,6 +619,39 @@ impl Registry {
             .insert(integration.name.clone(), integration);
         Ok(())
     }
+    /// Ship a role with the app: a record in the Roles resource named `name`
+    /// with this access map, created by `migrate` when no role of that name
+    /// (case-insensitive) exists. The map is checked against the registered
+    /// models, fields and actions when migrating, so a mistake fails the
+    /// app's tests and start rather than granting nothing. Later releases
+    /// update the map while the role still holds the defaults it was given;
+    /// once an administrator changes it, their version stays.
+    ///
+    /// # Errors
+    /// Rejects empty, reserved (`*`, `authenticated`, `Admin`) or duplicate
+    /// names and maps that are not objects.
+    pub fn role(&mut self, name: &str, permissions: Value) -> Result<(), ApiError> {
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || trimmed.chars().count() > 100
+            || ["*", "authenticated", "admin"].contains(&trimmed.to_lowercase().as_str())
+            || self
+                .roles
+                .keys()
+                .any(|role| role.eq_ignore_ascii_case(trimmed))
+        {
+            return Err(ApiError::Parse(format!(
+                "Invalid, reserved or duplicate role: {name}"
+            )));
+        }
+        if !permissions.is_object() {
+            return Err(ApiError::Parse(format!(
+                "Role {name}: permissions must be an object keyed by resource"
+            )));
+        }
+        self.roles.insert(trimmed.into(), permissions);
+        Ok(())
+    }
     /// Register an ordered, append-only SQL migration. Rejects invalid or duplicate migration names.
     ///
     /// # Errors
@@ -645,6 +680,7 @@ impl Registry {
             .map_err(ApiError::internal)?;
         super::core::ensure_admin_role(&mut tx, self).await?;
         super::integrations::sync_providers(&mut tx, &self.integrations).await?;
+        super::core::ensure_roles(&mut tx, self).await?;
         for (name, sql) in &self.migrations {
             let digest = super::hash(sql);
             let prior: Option<String> =
