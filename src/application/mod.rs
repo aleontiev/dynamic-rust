@@ -28,6 +28,7 @@ mod magic_auth;
 pub mod operator;
 mod preview;
 pub use google_auth::GoogleAuth;
+pub use magic_auth::LOGIN_VISUALS;
 
 const KINDS: [&str; 7] = [
     "users",

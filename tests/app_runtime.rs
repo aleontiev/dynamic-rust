@@ -288,6 +288,73 @@ async fn custom_login_branding_is_text_and_cannot_inject_markup() {
 }
 
 #[tokio::test]
+async fn login_visual_comes_from_branding_and_the_panel_has_no_text() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://unused@localhost/unused")
+        .unwrap();
+    let page = |branding: Value| {
+        let app = router(App {
+            registry: std::sync::Arc::default(),
+            pool: pool.clone(),
+            name: "Dummy".into(),
+            preview_origins: vec![],
+            origin: "https://dummy.example.org".into(),
+            mail_from: "no-reply@example.org".into(),
+            mail_region: "eu-west-1".into(),
+            mail_api_key: None,
+            google_auth: None,
+            mail_endpoint: None,
+            revision: "test".into(),
+            superusers: std::collections::BTreeSet::default(),
+            operator_secret: None,
+            branding,
+        });
+        async move {
+            let (status, _, html) = call(&app, "GET", "/api/login/", None).await;
+            assert_eq!(status, 200);
+            html.as_str().unwrap().to_owned()
+        }
+    };
+    for visual in dynamic_rust::application::LOGIN_VISUALS {
+        let html = page(json!({"company_name":"Example Company","login_visual":visual})).await;
+        assert!(
+            html.contains(&format!("data-visual=\"{visual}\"")),
+            "{visual}"
+        );
+        // Every visual is styled, and the client may switch to any of them.
+        assert!(
+            visual == "solid" || html.contains(&format!("[data-visual={visual}]")),
+            "{visual} has no styles"
+        );
+        assert!(html.contains(&format!("\"{visual}\"")));
+    }
+    // Unknown or hostile values fall back to the default, never into the markup.
+    for branding in [
+        json!({}),
+        json!({"login_visual":"sparkles"}),
+        json!({"login_visual":"\"><script>alert(1)</script>"}),
+        json!({"login_visual":7}),
+    ] {
+        let html = page(branding).await;
+        assert!(html.contains("data-visual=\"gradient\""));
+        assert!(!html.contains("alert(1)"));
+    }
+    // The side panel shows only the graphic; the company is named in the footer.
+    let html = page(json!({"company_name":"Example Company"})).await;
+    let panel = html
+        .split("<aside")
+        .nth(1)
+        .unwrap()
+        .split("</aside>")
+        .next()
+        .unwrap();
+    assert!(!panel.contains("Example Company") && !panel.contains("company-name"));
+    assert!(html.contains("© <span class=\"company-name\">Example Company</span>"));
+    assert_eq!(html.matches("<script ").count(), 3);
+    pool.close().await;
+}
+
+#[tokio::test]
 #[ignore = "requires isolated PostgreSQL and loopback mail transport"]
 async fn magic_link_delivery_confirmation_replay_and_logout() {
     let f = Fixture::new().await;
