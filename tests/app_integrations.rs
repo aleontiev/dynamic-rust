@@ -571,7 +571,7 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     assert_eq!(admin_role["permissions"]["orders"]["reject"], true);
     assert_eq!(
         admin_role["permissions"]["providers"],
-        json!({"list":true,"read":true,"update":true})
+        json!({"list":true,"read":true,"create":true,"update":true,"delete":true})
     );
     // Maps may name only registered actions of that resource.
     for permissions in [
@@ -708,8 +708,8 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     assert_eq!(providers.len(), 1, "migrating twice keeps one record");
     let provider = &providers[0];
     let provider_id = provider["id"].as_str().unwrap().to_owned();
-    assert_eq!(provider["name"], "books");
-    assert_eq!(provider["label"], "Books Online");
+    assert_eq!(provider["name"], "Books Online");
+    assert_eq!(provider["integration"], "books");
     assert_eq!(provider["kind"], "oauth2");
     assert_eq!(provider["status"], "needs_credentials");
     assert_eq!(provider["enabled"], true);
@@ -810,7 +810,7 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     assert_eq!(meta["fields"]["client_secret"]["read_only"], false);
     assert_eq!(meta["fields"]["status"]["read_only"], true);
     assert_eq!(meta["fields"]["redirect_uri"]["read_only"], true);
-    assert_eq!(meta["name_field"], "label");
+    assert_eq!(meta["fields"]["integration"]["read_only"], true);
     let names: Vec<_> = meta["actions"]
         .as_array()
         .unwrap()
@@ -818,7 +818,26 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
         .map(|a| a["name"].clone())
         .collect();
     assert_eq!(names, vec![json!("connect"), json!("disconnect")]);
-    // Providers cannot be created or deleted; integrations come from code.
+    // The integrator may not add or remove providers; the owner may add one by
+    // hand, but not remove one the code registered, nor change its kind.
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/api/admin/providers/",
+            &integrator,
+            json!({"name":"Mail","kind":"email"})
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        request(&app, "DELETE", &detail, &integrator, Value::Null)
+            .await
+            .0,
+        403
+    );
     assert_eq!(
         request(
             &app,
@@ -829,13 +848,47 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
         )
         .await
         .0,
-        405
+        400
     );
+    let (status, body) = request(&app, "DELETE", &detail, &owner, Value::Null).await;
+    assert_eq!(status, 409, "{body}");
     assert_eq!(
-        request(&app, "DELETE", &detail, &owner, Value::Null)
+        request(&app, "PATCH", &detail, &integrator, json!({"kind":"email"}))
             .await
             .0,
-        405
+        400
+    );
+    let (status, renamed) =
+        request(&app, "PATCH", &detail, &integrator, json!({"name":"Books"})).await;
+    assert_eq!(status, 200, "{renamed}");
+    assert_eq!(renamed["provider"]["name"], "Books");
+    assert_eq!(renamed["provider"]["integration"], "books");
+    let (status, mail) = request(
+        &app,
+        "POST",
+        "/api/admin/providers/",
+        &owner,
+        json!({"name":"Mail","kind":"email"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{mail}");
+    let mail_path = format!(
+        "/api/admin/providers/{}/",
+        mail["provider"]["id"].as_str().unwrap()
+    );
+    assert!(mail["provider"]["redirect_uri"].is_null());
+    assert_eq!(
+        request(&app, "PATCH", &mail_path, &owner, json!({"client_id":"x"}))
+            .await
+            .0,
+        400,
+        "only integrations take credentials"
+    );
+    assert_eq!(
+        request(&app, "DELETE", &mail_path, &owner, Value::Null)
+            .await
+            .0,
+        204
     );
 
     // --- Connecting -------------------------------------------------------------

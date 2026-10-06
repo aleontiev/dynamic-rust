@@ -8,6 +8,7 @@ use super::{App, DOCUMENT, extensions::Actor, public_record, singular};
 use crate::{ApiError, FieldErrors};
 use serde_json::{Value, json};
 use sqlx::PgConnection;
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 /// Role names that grants in code already mean something by.
@@ -105,7 +106,8 @@ pub(super) async fn write(
         }
         ("roles", "update") => {
             let id = id.ok_or(ApiError::NotFound)?;
-            let current = fetch(connection, kind, id).await?;
+            // The stored record, so what the public form leaves out is kept.
+            let current = raw(connection, kind, id).await?;
             let data = role_data(app, connection, id, &current, &input).await?;
             sqlx::query(
                 "UPDATE app_records SET data=$2,updated=now() WHERE kind='roles' AND id=$1",
@@ -153,10 +155,20 @@ pub(super) async fn write(
                 .map_err(ApiError::internal)?;
             current
         }
+        ("providers", "create") => {
+            let id = super::integrations::create(connection, &input).await?;
+            fetch(connection, kind, id).await?
+        }
         ("providers", "update") => {
             let id = id.ok_or(ApiError::NotFound)?;
             super::integrations::update(connection, id, &input).await?;
             fetch(connection, kind, id).await?
+        }
+        ("providers", "delete") => {
+            let id = id.ok_or(ApiError::NotFound)?;
+            let current = raw(connection, kind, id).await?;
+            super::integrations::delete(connection, &current).await?;
+            public_record(kind, current)
         }
         ("users", "delete") => {
             // Removing a person ends their sessions and sign-in identities; the
@@ -282,7 +294,13 @@ async fn role_data(
     )
     .map_err(|message| invalid("permissions", &message))?;
     let mut record = json!({"name":name,"permissions":permissions});
-    for key in ["managed", "description"] {
+    // The managed Admin role keeps what it knows about the defaults it holds.
+    for key in [
+        "managed",
+        "description",
+        "admin_defaults_version",
+        "admin_known",
+    ] {
         if let Some(value) = current.get(key) {
             record[key] = value.clone();
         }
@@ -329,11 +347,7 @@ pub(crate) fn admin_access_map(registry: &super::extensions::Registry) -> Value 
         map.insert(
             kind.into(),
             match kind {
-                "roles" | "dashboards" | "views" => all.clone(),
-                "users" => {
-                    json!({"list":true,"read":true,"create":true,"update":true,"delete":true})
-                }
-                "providers" => json!({"list":true,"read":true,"update":true}),
+                "roles" | "dashboards" | "views" | "users" | "providers" => all.clone(),
                 _ => json!({"list":true,"read":true}),
             },
         );
@@ -350,27 +364,119 @@ pub(crate) fn admin_access_map(registry: &super::extensions::Registry) -> Value 
     Value::Object(map)
 }
 
-/// The Admin role that grants everything, created on first use and kept in step
-/// with the registered models. The name is fixed; other roles are the owner's.
+/// The version of [`admin_access_map`]'s defaults recorded on the Admin role.
+/// Version 1 kept providers read-only and could not grant actions.
+const ADMIN_DEFAULTS_VERSION: i64 = 2;
+
+/// Whether an Admin role still holds the version 1 defaults, which the runtime
+/// rewrote on every start: roles, users, dashboards and views in full, the
+/// other built-ins read-only, and every model in full.
+fn legacy_admin_map(permissions: &Value) -> bool {
+    let all = json!({"list":true,"read":true,"create":true,"update":true,"delete":true});
+    let Some(map) = permissions.as_object() else {
+        return false;
+    };
+    super::KINDS.iter().all(|kind| {
+        map.get(*kind)
+            == Some(
+                &if matches!(*kind, "roles" | "users" | "dashboards" | "views") {
+                    all.clone()
+                } else {
+                    json!({"list":true,"read":true})
+                },
+            )
+    }) && map
+        .iter()
+        .all(|(name, rules)| super::KINDS.contains(&name.as_str()) || rules == &all)
+}
+
+/// What the Admin role is granted, one entry per resource and per action
+/// (`model.action`), so it can tell what the app has gained since.
+fn admin_targets(registry: &super::extensions::Registry) -> BTreeSet<String> {
+    super::KINDS
+        .iter()
+        .map(|kind| (*kind).to_owned())
+        .chain(registry.models.keys().cloned())
+        .chain(
+            registry
+                .actions
+                .keys()
+                .map(|(model, action)| format!("{model}.{action}")),
+        )
+        .collect()
+}
+
+/// The Admin role that grants everything, created on first use. Its name is
+/// fixed; other roles are the owner's. The owner may narrow it like any other
+/// role, and those choices last: only what the app gains later — a model, an
+/// action, a built-in resource — is granted to it, once. A role still holding
+/// the version 1 defaults is brought up to date once; one an owner had
+/// customised before then is left as it is.
 pub async fn ensure_admin_role(
     connection: &mut PgConnection,
     registry: &super::extensions::Registry,
 ) -> Result<Uuid, ApiError> {
-    let permissions = admin_access_map(registry);
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM app_records WHERE kind='roles' AND lower(data->>'name')='admin' ORDER BY created,id LIMIT 1",
+    let defaults = admin_access_map(registry);
+    let targets = admin_targets(registry);
+    let existing: Option<(Uuid, Value)> = sqlx::query_as(
+        "SELECT id,data FROM app_records WHERE kind='roles' AND lower(data->>'name')='admin' ORDER BY created,id LIMIT 1",
     )
     .fetch_optional(&mut *connection)
     .await
     .map_err(ApiError::internal)?;
-    let id = existing.unwrap_or_else(Uuid::new_v4);
-    sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'roles',$2) ON CONFLICT(id) DO UPDATE SET data=jsonb_set(app_records.data,'{permissions}',$3),updated=now() WHERE app_records.data->'permissions' IS DISTINCT FROM $3")
-        .bind(id)
-        .bind(json!({"name":"Admin","permissions":permissions,"managed":true,"description":"Full access to every resource. Managed by the app; make other roles for narrower access."}))
-        .bind(&permissions)
-        .execute(&mut *connection)
-        .await
-        .map_err(ApiError::internal)?;
+    let Some((id, mut data)) = existing else {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'roles',$2)")
+            .bind(id)
+            .bind(json!({"name":"Admin","permissions":defaults,"managed":true,
+                "description":"Full access to every resource. Managed by the app; make other roles for narrower access.",
+                "admin_defaults_version":ADMIN_DEFAULTS_VERSION,"admin_known":targets}))
+            .execute(&mut *connection)
+            .await
+            .map_err(ApiError::internal)?;
+        return Ok(id);
+    };
+    let before = data.clone();
+    if data["admin_defaults_version"].as_i64().unwrap_or(1) < ADMIN_DEFAULTS_VERSION {
+        if legacy_admin_map(&data["permissions"]) {
+            data["permissions"] = defaults;
+        }
+        data["admin_defaults_version"] = json!(ADMIN_DEFAULTS_VERSION);
+        data["admin_known"] = json!(targets);
+    } else {
+        let mut known: BTreeSet<String> = data["admin_known"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|target| target.as_str().map(str::to_owned))
+            .collect();
+        if !data["permissions"].is_object() {
+            data["permissions"] = json!({});
+        }
+        for target in targets.difference(&known.clone()) {
+            let permissions = &mut data["permissions"];
+            match target.split_once('.') {
+                Some((model, action)) => {
+                    if !permissions[model].is_object() {
+                        permissions[model] = json!({});
+                    }
+                    permissions[model][action] = json!(true);
+                }
+                None => permissions[target.as_str()] = defaults[target.as_str()].clone(),
+            }
+            known.insert(target.clone());
+        }
+        data["admin_known"] = json!(known);
+    }
+    data["managed"] = json!(true);
+    if data != before {
+        sqlx::query("UPDATE app_records SET data=$2,updated=now() WHERE kind='roles' AND id=$1")
+            .bind(id)
+            .bind(&data)
+            .execute(&mut *connection)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     Ok(id)
 }
 

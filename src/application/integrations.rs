@@ -1,10 +1,10 @@
 //! OAuth 2 connections to outside services: accounting, chat, storage.
 //!
 //! An app registers each service it talks to with [`Integration`]. Every
-//! registered integration is a `providers` record: administrators (anyone whose
-//! roles grant `providers` `update`) enter the client ID and secret from the
-//! service's developer console, register the record's `redirect_uri` there, and
-//! press **Connect**. The service sends the browser back to
+//! registered integration is a `providers` record whose `integration` names it:
+//! administrators (anyone whose roles grant `providers` `update`) enter the
+//! client ID and secret from the service's developer console, register the
+//! record's `redirect_uri` there, and press **Connect**. The service sends the browser back to
 //! `/api/integrations/<name>/callback`, the runtime exchanges the code for tokens
 //! and keeps them in `app_integration_secrets`, which no API returns. Code uses
 //! the connection through [`Context::integration`], which refreshes the access
@@ -159,16 +159,17 @@ fn callback_url(origin: &str, name: &str) -> String {
     format!("{origin}/api/integrations/{name}/callback")
 }
 
-/// Keep one `providers` record per registered integration, adding new ones as
-/// needing credentials and refreshing the label and description of the rest.
+/// Keep one `providers` record per registered integration, adding new ones,
+/// named after the integration's label, as needing credentials, and refreshing
+/// the description of the rest. Administrators may rename them.
 pub(super) async fn sync_providers(
     connection: &mut PgConnection,
     integrations: &BTreeMap<String, Integration>,
 ) -> Result<(), ApiError> {
     for integration in integrations.values() {
-        let presentation = json!({"label":integration.label,"kind":"oauth2","description":integration.description});
+        let presentation = json!({"kind":"oauth2","description":integration.description});
         let updated = sqlx::query(
-            "UPDATE app_records SET data=data||$2,updated=now() WHERE kind='providers' AND data->>'name'=$1 AND NOT (data @> $2)",
+            "UPDATE app_records SET data=data||$2,updated=now() WHERE kind='providers' AND data->>'integration'=$1 AND NOT (data @> $2)",
         )
         .bind(&integration.name)
         .bind(&presentation)
@@ -179,12 +180,13 @@ pub(super) async fn sync_providers(
             continue;
         }
         let mut data = presentation;
-        data["name"] = json!(integration.name);
+        data["name"] = json!(integration.label);
+        data["integration"] = json!(integration.name);
         data["enabled"] = json!(true);
         data["status"] = json!("needs_credentials");
         data["account"] = json!({});
         sqlx::query(
-            "INSERT INTO app_records(id,kind,data) SELECT $1,'providers',$2 WHERE NOT EXISTS (SELECT 1 FROM app_records WHERE kind='providers' AND data->>'name'=$3)",
+            "INSERT INTO app_records(id,kind,data) SELECT $1,'providers',$2 WHERE NOT EXISTS (SELECT 1 FROM app_records WHERE kind='providers' AND data->>'integration'=$3)",
         )
         .bind(Uuid::new_v4())
         .bind(&data)
@@ -199,13 +201,78 @@ pub(super) async fn sync_providers(
 /// Add what a provider record shows but does not store: the redirect URI to
 /// register with the service, and whether a client secret is saved.
 pub(super) fn present(app: &App, record: &mut Value, secret_saved: bool) {
-    let Some(name) = record["name"].as_str().map(str::to_owned) else {
+    let Some(name) = record["integration"].as_str().map(str::to_owned) else {
         return;
     };
     if app.registry.integrations.contains_key(&name) {
         record["redirect_uri"] = json!(callback_url(&app.origin, &name));
     }
     record["client_secret"] = json!(if secret_saved { "Saved" } else { "" });
+}
+/// Whether a provider record has a saved client secret.
+pub(super) fn secret_saved(saved: &[String], record: &Value) -> bool {
+    record["integration"]
+        .as_str()
+        .is_some_and(|name| saved.iter().any(|saved| saved == name))
+}
+fn provider_name(value: &Value) -> Result<String, ApiError> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && name.chars().count() <= 200)
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("name", "Name must be 1 to 200 characters."))
+}
+fn provider_kind(value: &Value) -> Result<String, ApiError> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty() && kind.chars().count() <= 100)
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("kind", "Kind must be 1 to 100 characters."))
+}
+fn provider_enabled(value: &Value) -> Result<bool, ApiError> {
+    value
+        .as_bool()
+        .ok_or_else(|| invalid("enabled", "Must be true or false."))
+}
+/// A provider an administrator adds by hand (a mail or sign-in service the
+/// app's code reads): a `name`, a `kind` and whether it is `enabled`. Other
+/// input is ignored.
+pub(super) async fn create(connection: &mut PgConnection, input: &Value) -> Result<Uuid, ApiError> {
+    let name = provider_name(input.get("name").unwrap_or(&Value::Null))?;
+    let kind = provider_kind(input.get("kind").unwrap_or(&Value::Null))?;
+    let enabled = match input.get("enabled") {
+        None | Some(Value::Null) => true,
+        Some(value) => provider_enabled(value)?,
+    };
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'providers',$2)")
+        .bind(id)
+        .bind(json!({"name":name,"kind":kind,"enabled":enabled}))
+        .execute(&mut *connection)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(id)
+}
+/// Remove a provider an administrator added. Integrations belong to the app's
+/// code, which would add them back, so they are disconnected instead.
+pub(super) async fn delete(connection: &mut PgConnection, current: &Value) -> Result<(), ApiError> {
+    if current["integration"].is_string() {
+        return Err(ApiError::Conflict(
+            "This provider comes from the app's code and cannot be removed; disconnect it instead."
+                .into(),
+        ));
+    }
+    sqlx::query("DELETE FROM app_records WHERE kind='providers' AND id=$1")
+        .bind(
+            Uuid::parse_str(current["id"].as_str().unwrap_or_default())
+                .map_err(ApiError::internal)?,
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
 }
 pub(super) async fn secrets_saved(pool: &PgPool) -> Result<Vec<String>, ApiError> {
     sqlx::query_scalar(
@@ -216,9 +283,12 @@ pub(super) async fn secrets_saved(pool: &PgPool) -> Result<Vec<String>, ApiError
     .map_err(ApiError::internal)
 }
 
-/// Apply an administrator's changes to a provider: `enabled`, `client_id` and a
-/// new `client_secret` (blank keeps the saved one). Changing the client clears
-/// the connection, since its tokens belong to the old one.
+/// Apply an administrator's changes to a provider: its `name`, `kind` and
+/// `enabled`, and for an integration its `client_id` and a new `client_secret`
+/// (blank keeps the saved one). Other input, and anything else the record
+/// holds, is left alone. An integration's kind belongs to the code, and
+/// changing its client clears the connection, since the tokens belong to the
+/// old one.
 pub(super) async fn update(
     connection: &mut PgConnection,
     id: Uuid,
@@ -232,18 +302,65 @@ pub(super) async fn update(
     .await
     .map_err(ApiError::internal)?
     .ok_or(ApiError::NotFound)?;
-    let name = current["name"].as_str().unwrap_or_default().to_owned();
+    let integration = current["integration"].as_str().map(str::to_owned);
     let mut data = current.clone();
     for reserved in ["id", "created", "updated"] {
         data.as_object_mut().map(|o| o.remove(reserved));
     }
-    if let Some(enabled) = input.get("enabled") {
-        data["enabled"] = json!(
-            enabled
-                .as_bool()
-                .ok_or_else(|| invalid("enabled", "Must be true or false."))?
-        );
+    if let Some(name) = input.get("name") {
+        data["name"] = json!(provider_name(name)?);
     }
+    if let Some(kind) = input.get("kind") {
+        let kind = provider_kind(kind)?;
+        if integration.is_some() && current["kind"].as_str() != Some(kind.as_str()) {
+            return Err(invalid(
+                "kind",
+                "This provider's kind is set by the app's code.",
+            ));
+        }
+        data["kind"] = json!(kind);
+    }
+    if let Some(enabled) = input.get("enabled") {
+        data["enabled"] = json!(provider_enabled(enabled)?);
+    }
+    let Some(name) = integration else {
+        for field in ["client_id", "client_secret"] {
+            if input
+                .get(field)
+                .is_some_and(|value| !value.is_null() && value != "")
+            {
+                return Err(invalid(field, "Only integrations take client credentials."));
+            }
+        }
+        sqlx::query(
+            "UPDATE app_records SET data=$2,updated=now() WHERE kind='providers' AND id=$1",
+        )
+        .bind(id)
+        .bind(&data)
+        .execute(&mut *connection)
+        .await
+        .map_err(ApiError::internal)?;
+        return Ok(());
+    };
+    credentials(connection, &name, &current, input, &mut data).await?;
+    sqlx::query("UPDATE app_records SET data=$2,updated=now() WHERE kind='providers' AND id=$1")
+        .bind(id)
+        .bind(&data)
+        .execute(&mut *connection)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+/// Save an integration's new client ID or secret; either clears its
+/// connection, since the tokens belong to the old client.
+async fn credentials(
+    connection: &mut PgConnection,
+    name: &str,
+    current: &Value,
+    input: &Value,
+    data: &mut Value,
+) -> Result<(), ApiError> {
     let mut reset = false;
     if let Some(client_id) = input.get("client_id") {
         let client_id = match client_id {
@@ -271,13 +388,13 @@ pub(super) async fn update(
     if let Some(secret) = &secret {
         reset = true;
         sqlx::query("INSERT INTO app_integration_secrets(provider,client_secret) VALUES($1,$2) ON CONFLICT(provider) DO UPDATE SET client_secret=EXCLUDED.client_secret,updated=now()")
-            .bind(&name).bind(secret).execute(&mut *connection).await.map_err(ApiError::internal)?;
+            .bind(name).bind(secret).execute(&mut *connection).await.map_err(ApiError::internal)?;
     }
     if reset {
         sqlx::query("UPDATE app_integration_secrets SET access_token=NULL,refresh_token=NULL,expires=NULL,updated=now() WHERE provider=$1")
-            .bind(&name).execute(&mut *connection).await.map_err(ApiError::internal)?;
+            .bind(name).execute(&mut *connection).await.map_err(ApiError::internal)?;
         let has_secret: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM app_integration_secrets WHERE provider=$1 AND client_secret IS NOT NULL)")
-            .bind(&name).fetch_one(&mut *connection).await.map_err(ApiError::internal)?;
+            .bind(name).fetch_one(&mut *connection).await.map_err(ApiError::internal)?;
         let configured = has_secret && !data["client_id"].as_str().unwrap_or_default().is_empty();
         data["status"] = json!(if configured {
             "disconnected"
@@ -288,12 +405,6 @@ pub(super) async fn update(
         data["error"] = Value::Null;
         data["connected_at"] = Value::Null;
     }
-    sqlx::query("UPDATE app_records SET data=$2,updated=now() WHERE kind='providers' AND id=$1")
-        .bind(id)
-        .bind(&data)
-        .execute(&mut *connection)
-        .await
-        .map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -332,7 +443,10 @@ pub(super) async fn action(
     .await
     .map_err(ApiError::internal)?
     .ok_or(ApiError::NotFound)?;
-    let provider = record["name"].as_str().unwrap_or_default().to_owned();
+    let provider = record["integration"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     let integration = app
         .registry
         .integrations
@@ -429,7 +543,7 @@ pub(super) async fn callback(
         ));
     };
     let (id, record): (Uuid, Value) = sqlx::query_as(
-        "SELECT id,data FROM app_records WHERE kind='providers' AND data->>'name'=$1",
+        "SELECT id,data FROM app_records WHERE kind='providers' AND data->>'integration'=$1",
     )
     .bind(&provider)
     .fetch_one(&app.pool)
@@ -600,7 +714,7 @@ async fn current(
 ) -> Result<Connection, ApiError> {
     let name = &integration.name;
     let record: Value = sqlx::query_scalar(
-        "SELECT data FROM app_records WHERE kind='providers' AND data->>'name'=$1",
+        "SELECT data FROM app_records WHERE kind='providers' AND data->>'integration'=$1",
     )
     .bind(name)
     .fetch_optional(&mut *connection)
@@ -661,7 +775,7 @@ async fn current(
             })
         }
         Err(message) => {
-            sqlx::query("UPDATE app_records SET data=data||jsonb_build_object('status','error','error',$2::text),updated=now() WHERE kind='providers' AND data->>'name'=$1")
+            sqlx::query("UPDATE app_records SET data=data||jsonb_build_object('status','error','error',$2::text),updated=now() WHERE kind='providers' AND data->>'integration'=$1")
                 .bind(name)
                 .bind(format!("Refreshing access failed: {}. Connect it again.", truncate(&message)))
                 .execute(&mut *connection)

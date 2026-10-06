@@ -85,17 +85,24 @@ Superusers, and holders of a role whose map grants those operations on `roles`
 and `users`, create, edit and delete roles, add and remove users (removing
 one ends their sessions and sign-in identities; nobody removes themselves), and
 set the `roles` (and `name`) of users; deleting a role removes it from every user. `dashboards` and `views`
-(the admin's saved pages) are written the same way, and `providers` take
-updates to their credentials (see [Calling outside services](#calling-outside-services)).
-Everything else built in remains read-only. Role names must be unique; `*` and `authenticated` are
+(the admin's saved pages) are written the same way. So are `providers`: a
+role granting their operations adds one by hand with a `name`, a `kind` and
+`enabled`, edits and removes it; anything else stored on the record stays
+private and unchanged. Providers the app's code registers (see
+[Calling outside services](#calling-outside-services)) can be renamed but keep
+their kind and cannot be removed. Everything else built in remains read-only. Role names must be unique; `*` and `authenticated` are
 reserved. Role entries on a user that are not record ids are still treated as
 role names, so applications that assigned roles by name keep working.
 
 `registry.migrate` provisions a managed **Admin** role granting every
-operation on every resource, users included and keeps its map in
-step with the registered models; its name is fixed. A superuser who signs in
-holds it, so the owner's own record shows and carries full access from the
-first sign-in. Make other roles for narrower access.
+operation on every resource, users and providers included, and every action;
+its name is fixed. A superuser who signs in holds it, so the owner's own record
+shows and carries full access from the first sign-in. The owner may narrow it
+like any other role and that choice lasts: later releases grant it only what
+the app gained since — a new model, action or built-in resource — once. A role
+still holding the earlier defaults (providers read-only, no actions) is brought
+up to date once; one an owner had customised is left alone. Make other roles
+for narrower access.
 
 Signing in with Google also fills a person's `photo` — Google's profile picture
 URL — when they have none yet; a photo already set is kept. Users carry it as a

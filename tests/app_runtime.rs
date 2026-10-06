@@ -822,7 +822,7 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             .0,
             200
         );
-        // Roles, dashboards, views and users can be created by people whose roles
+        // Roles, dashboards, views, providers and users can be created by people whose roles
         // allow it; this viewer's cannot. Every other built-in resource is read-only.
         assert_eq!(
             call(
@@ -833,7 +833,10 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             )
             .await
             .0,
-            if matches!(kind, "roles" | "dashboards" | "views" | "users") {
+            if matches!(
+                kind,
+                "roles" | "dashboards" | "views" | "users" | "providers"
+            ) {
                 403
             } else {
                 405
@@ -1345,5 +1348,272 @@ async fn operator_grants_open_sessions_for_named_users_only_when_valid() {
         401
     );
     plain.close().await;
+    f.close().await;
+}
+
+async fn admin_write(
+    app: &Router,
+    method: &str,
+    path: &str,
+    cookie: &str,
+    body: Value,
+) -> (u16, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn owner_session(f: &Fixture, secret: &str) -> String {
+    let expires = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+        + 60;
+    let (status, _, session) = post(
+        &f.app,
+        "/api/operator/session",
+        json!({
+            "email":"owner@example.org", "expires":expires,
+            "signature":dynamic_rust::application::operator::sign(secret, "owner@example.org", expires),
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{session}");
+    format!("dream_app={}", session["token"].as_str().unwrap())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn providers_are_editable_by_admins_and_saved_grants_survive_sign_in() {
+    let secret = "provider-admin-test-secret-0123456789";
+    let f = Fixture::configure(false, Some(secret)).await;
+    let owner = owner_session(&f, secret).await;
+    let (_, _, roles) = call(&f.app, "GET", "/api/admin/roles/", Some(&owner)).await;
+    let admin = roles["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|role| role["name"] == "Admin")
+        .unwrap();
+    let role_id = admin["id"].as_str().unwrap();
+    let role_path = format!("/api/admin/roles/{role_id}/");
+    let all = json!({"list":true,"read":true,"create":true,"update":true,"delete":true});
+    assert_eq!(admin["permissions"]["providers"], all);
+    // Exercise a regular user holding Admin, as well as the superuser bypass.
+    sqlx::query("UPDATE app_records SET data=jsonb_set(data,'{data,roles}',$2) WHERE id=$1")
+        .bind(f.user)
+        .bind(json!([role_id]))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    for cookie in [&owner, &f.cookie] {
+        let (_, _, schema) = call(&f.app, "OPTIONS", "/api/admin/providers/", Some(cookie)).await;
+        for operation in ["create", "update", "delete"] {
+            assert_eq!(schema["permissions"][operation], true);
+        }
+        for field in ["name", "kind", "enabled"] {
+            assert_eq!(schema["fields"][field]["read_only"], false);
+            assert_eq!(
+                schema["permissions"]["fields"][field]["write"],
+                json!({"create":true,"update":true})
+            );
+        }
+        assert_eq!(schema["fields"]["kind"]["required"], true);
+    }
+    for input in [
+        json!({"name":"", "kind":"email"}),
+        json!({"name":"Mail", "kind":false}),
+        json!({"name":"Mail", "kind":"email", "enabled":"yes"}),
+    ] {
+        assert_eq!(
+            admin_write(&f.app, "POST", "/api/admin/providers/", &f.cookie, input)
+                .await
+                .0,
+            400
+        );
+    }
+    let (status, created) = admin_write(
+        &f.app,
+        "POST",
+        "/api/admin/providers/",
+        &f.cookie,
+        json!({"provider":{"name":"  Mail service  ","kind":" email "}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["provider"]["name"], "Mail service");
+    assert_eq!(created["provider"]["kind"], "email");
+    assert_eq!(created["provider"]["enabled"], true);
+    let id = created["provider"]["id"].as_str().unwrap();
+    let path = format!("/api/admin/providers/{id}/");
+    sqlx::query("UPDATE app_records SET data=data || $2 WHERE id=$1")
+        .bind(Uuid::parse_str(id).unwrap())
+        .bind(json!({"secret":"keep-private","credentials":{"key":"keep-private"}}))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let (status, updated) = admin_write(
+        &f.app,
+        "PATCH",
+        &path,
+        &f.cookie,
+        json!({"name":"Renamed mail","enabled":false,"secret":"overwrite"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["provider"]["kind"], "email");
+    assert_eq!(updated["provider"]["enabled"], false);
+    assert!(!updated.to_string().contains("private"));
+    let stored: Value = sqlx::query_scalar("SELECT data FROM app_records WHERE id=$1")
+        .bind(Uuid::parse_str(id).unwrap())
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored["secret"], "keep-private");
+    assert_eq!(stored["credentials"]["key"], "keep-private");
+
+    // An explicit denial and a removed resource both survive logout/sign-in and migrations.
+    let mut permissions = admin["permissions"].clone();
+    permissions["providers"] =
+        json!({"list":true,"read":true,"create":true,"update":false,"delete":false});
+    permissions.as_object_mut().unwrap().remove("dashboards");
+    assert_eq!(
+        admin_write(
+            &f.app,
+            "PATCH",
+            &role_path,
+            &owner,
+            json!({"permissions":permissions})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        call(&f.app, "GET", "/api/logout/", Some(&owner)).await.0,
+        303
+    );
+    let owner = owner_session(&f, secret).await;
+    dynamic_rust::application::extensions::Registry::default()
+        .migrate(&f.pool)
+        .await
+        .unwrap();
+    let (_, _, saved) = call(&f.app, "GET", &role_path, Some(&owner)).await;
+    assert_eq!(saved["role"]["permissions"], permissions);
+    assert_eq!(
+        admin_write(&f.app, "PATCH", &path, &f.cookie, json!({"name":"Denied"}))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(call(&f.app, "DELETE", &path, Some(&f.cookie)).await.0, 403);
+    let (_, _, schema) = call(&f.app, "OPTIONS", "/api/admin/providers/", Some(&f.cookie)).await;
+    assert_eq!(schema["permissions"]["create"], true);
+    assert_eq!(schema["permissions"]["update"], false);
+    permissions["providers"] = all;
+    assert_eq!(
+        admin_write(
+            &f.app,
+            "PATCH",
+            &role_path,
+            &owner,
+            json!({"permissions":permissions})
+        )
+        .await
+        .0,
+        200
+    );
+    let (status, updated) = admin_write(
+        &f.app,
+        "PUT",
+        &path,
+        &f.cookie,
+        json!({"name":"Updated provider","kind":"smtp","enabled":true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["provider"]["kind"], "smtp");
+    assert_eq!(call(&f.app, "DELETE", &path, Some(&f.cookie)).await.0, 204);
+    assert_eq!(call(&f.app, "GET", &path, Some(&f.cookie)).await.0, 404);
+    f.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn legacy_admin_defaults_are_repaired_once_and_custom_permissions_are_preserved() {
+    let secret = "legacy-admin-test-secret-0123456789";
+    let f = Fixture::configure(false, Some(secret)).await;
+    let mut legacy = json!({});
+    for kind in CORE {
+        legacy[kind] = if matches!(kind, "roles" | "users" | "dashboards" | "views") {
+            json!({"list":true,"read":true,"create":true,"update":true,"delete":true})
+        } else {
+            json!({"list":true,"read":true})
+        };
+    }
+    let id = f
+        .insert(
+            "roles",
+            json!({"name":"Admin","managed":true,"permissions":legacy}),
+        )
+        .await;
+    let path = format!("/api/admin/roles/{id}/");
+    let owner = owner_session(&f, secret).await;
+    let (_, _, repaired) = call(&f.app, "GET", &path, Some(&owner)).await;
+    assert_eq!(repaired["role"]["permissions"]["providers"]["create"], true);
+    // Saving the old defaults intentionally must not trigger the repair again.
+    assert_eq!(
+        admin_write(
+            &f.app,
+            "PATCH",
+            &path,
+            &owner,
+            json!({"permissions":legacy})
+        )
+        .await
+        .0,
+        200
+    );
+    let owner = owner_session(&f, secret).await;
+    let (_, _, saved) = call(&f.app, "GET", &path, Some(&owner)).await;
+    assert_eq!(saved["role"]["permissions"], legacy);
+    let stored: Value = sqlx::query_scalar("SELECT data FROM app_records WHERE id=$1")
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored["admin_defaults_version"], 2);
+    assert_eq!(stored["managed"], true);
+    // A pre-upgrade role with customized grants is left intact, too.
+    let custom = json!({"providers":{"list":true,"read":true,"create":true},"users":{"list":true}});
+    sqlx::query("UPDATE app_records SET data=(data-'admin_defaults_version') || $2 WHERE id=$1")
+        .bind(id)
+        .bind(json!({"permissions":custom}))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let owner = owner_session(&f, secret).await;
+    let (_, _, saved) = call(&f.app, "GET", &path, Some(&owner)).await;
+    assert_eq!(saved["role"]["permissions"], custom);
     f.close().await;
 }

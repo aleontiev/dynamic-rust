@@ -220,10 +220,10 @@ fn fields(kind: &str) -> Vec<(&str, &str)> {
         "roles" => vec![("name", "string"), ("permissions", "permissions")],
         "providers" => vec![
             ("name", "string"),
-            ("label", "string"),
-            ("description", "string"),
             ("kind", "string"),
             ("enabled", "boolean"),
+            ("integration", "string"),
+            ("description", "string"),
             ("status", "string"),
             ("account", "json"),
             ("connected_at", "datetime"),
@@ -258,7 +258,7 @@ fn writable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
         ("dashboards", "name" | "data") | ("views", "name" | "resource" | "data") => {
             actor.granted(kind, "update")
         }
-        ("providers", "enabled" | "client_id" | "client_secret") => {
+        ("providers", "name" | "kind" | "enabled" | "client_id" | "client_secret") => {
             actor.granted("providers", "update")
         }
         _ => false,
@@ -269,6 +269,7 @@ fn writable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
 fn creatable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
     match (kind, field) {
         ("users", "name" | "email" | "roles") => actor.granted("users", "create"),
+        ("providers", "name" | "kind" | "enabled") => actor.granted("providers", "create"),
         ("roles", "name" | "permissions") => actor.granted("roles", "create"),
         ("dashboards", "name" | "data") | ("views", "name" | "resource" | "data") => {
             actor.granted(kind, "create")
@@ -281,9 +282,9 @@ pub(crate) fn core_supports(kind: &str, operation: &str) -> bool {
     matches!(
         (kind, operation),
         (
-            "roles" | "dashboards" | "views" | "users",
+            "roles" | "dashboards" | "views" | "users" | "providers",
             "create" | "update" | "delete"
-        ) | ("providers", "update")
+        )
     )
 }
 /// The roles that exist, as choices for a user's `roles` field.
@@ -313,7 +314,7 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
         let write=writable(kind,name,actor);
         let create=creatable(kind,name,actor);
         let editable=write||create;
-        let required=editable && (name=="name" || (kind=="users" && name=="email"));
+        let required=editable && (name=="name" || (kind=="users" && name=="email") || (kind=="providers" && name=="kind"));
         let mut field=json!({"name":name,"label":crate::python_title(&name.replace('_'," ")),"type":typ,"read_only":!editable,"required":required,"nullable":!editable,"null":!editable,"many":typ=="relation","ui":true,"hidden":false,"deferred":false,"sortable":filterable(kind,name),"filterable":filterable(kind,name)});
         match (kind,name) {
             ("users","roles")=>{
@@ -327,7 +328,8 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
             }
             ("providers",_)=>{
                 let description=match name {
-                    "status"=>"needs_credentials until the client ID and secret are saved, then disconnected, connected, or error when access was refused or lost.",
+                    "integration"=>"The service in the app's code this provider connects, if any.",
+                    "status"=>"For an integration: needs_credentials until the client ID and secret are saved, then disconnected, connected, or error when access was refused or lost.",
                     "account"=>"The account this app is connected to, as the service identified it.",
                     "error"=>"Why the last attempt to connect or refresh access failed.",
                     "client_id"=>"The OAuth client ID from the service's developer console.",
@@ -369,8 +371,7 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
         .collect();
     let mut value = json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":crate::python_title(&kind.replace('_'," ")),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":section(kind),"fields":fields,"permissions":{"list":readable,"read":readable,"create":operations["create"],"update":operations["update"],"delete":operations["delete"],"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]});
     if kind == "providers" {
-        value["name_field"] = json!("label");
-        value["list_fields"] = json!(["label", "status", "connected_at"]);
+        value["list_fields"] = json!(["name", "kind", "status", "enabled"]);
         value["actions"] = if actor.granted("providers", "update") {
             integrations::actions()
         } else {
@@ -614,9 +615,7 @@ async fn list(
     };
     for record in &mut records {
         if kind == "providers" {
-            let secret = saved
-                .iter()
-                .any(|name| record["name"].as_str() == Some(name));
+            let secret = integrations::secret_saved(&saved, record);
             integrations::present(&app, record, secret);
         }
         *record = project_record(&kind, record.take(), &features);
@@ -660,9 +659,7 @@ async fn retrieve(
     .ok_or(ApiError::NotFound)?;
     if kind == "providers" {
         let saved = integrations::secrets_saved(&app.pool).await?;
-        let secret = saved
-            .iter()
-            .any(|name| record["name"].as_str() == Some(name));
+        let secret = integrations::secret_saved(&saved, &record);
         integrations::present(&app, &mut record, secret);
     }
     let features = QueryFeatures::parse(raw.as_deref().unwrap_or(""), 10000)?;
@@ -763,11 +760,9 @@ async fn core_write(
     extensions::lock(&mut tx).await?;
     let mut record = core::write(app, &mut tx, &actor, kind, id, input, method).await?;
     tx.commit().await.map_err(ApiError::internal)?;
-    if kind == "providers" {
+    if kind == "providers" && record.is_object() {
         let saved = integrations::secrets_saved(&app.pool).await?;
-        let secret = saved
-            .iter()
-            .any(|name| record["name"].as_str() == Some(name));
+        let secret = integrations::secret_saved(&saved, &record);
         integrations::present(app, &mut record, secret);
     }
     Ok(record)
