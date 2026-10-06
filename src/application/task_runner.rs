@@ -1,7 +1,10 @@
 //! Durable at-least-once business tasks. Invoke [`drain`] from a scheduled,
 //! IAM-only Lambda, or [`tick`] from a native loop. External providers must
 //! honor the task idempotency key.
-use super::{App, DOCUMENT, extensions::Context};
+use super::{
+    App, DOCUMENT,
+    extensions::{Actor, Context},
+};
 use crate::ApiError;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -24,26 +27,27 @@ pub async fn tick(app: &App) -> Result<bool, ApiError> {
         if !live {
             return Err(ApiError::Conflict("Task lease expired".into()));
         }
-        let user: Value = sqlx::query_scalar(&format!(
-            "SELECT {DOCUMENT} FROM app_records WHERE kind='users' AND id=$1"
-        ))
-        .bind(
-            Uuid::parse_str(actor["id"].as_str().unwrap_or_default())
-                .map_err(ApiError::internal)?,
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(ApiError::internal)?
-        .ok_or(ApiError::Forbidden)?;
+        // Scheduled tasks run as the app; others as the person whose write queued them.
+        let actor = if actor["system"] == true {
+            Actor::system()
+        } else {
+            let user: Value = sqlx::query_scalar(&format!(
+                "SELECT {DOCUMENT} FROM app_records WHERE kind='users' AND id=$1"
+            ))
+            .bind(
+                Uuid::parse_str(actor["id"].as_str().unwrap_or_default())
+                    .map_err(ApiError::internal)?,
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or(ApiError::Forbidden)?;
+            app.actor(&user).await?
+        };
         let handler = app.registry.tasks.get(&name).ok_or(ApiError::NotFound)?;
         let result = handler
             .run(
-                &mut Context::deferred(
-                    &mut tx,
-                    &app.registry,
-                    app.actor(&user).await?,
-                    app.pool.clone(),
-                ),
+                &mut Context::deferred(&mut tx, &app.registry, actor, app.pool.clone()),
                 json!({"task_id":id,"idempotency_key":key,"data":input}),
             )
             .await?;
@@ -53,23 +57,56 @@ pub async fn tick(app: &App) -> Result<bool, ApiError> {
         }
         tx.commit().await.map_err(ApiError::internal)
     };
-    match tokio::time::timeout(std::time::Duration::from_secs(60), work).await {
-        Ok(Ok(())) => {}
-        _ => {
-            sqlx::query("UPDATE app_tasks SET state=CASE WHEN attempts>=5 THEN 'failed' ELSE 'queued' END,error='Task execution failed; retry with the same idempotency key',available=now()+make_interval(secs=>least(300,power(2,attempts)::int)),lease_until=NULL,updated=now() WHERE id=$1 AND lease_token=$2").bind(id).bind(token).execute(&app.pool).await.map_err(ApiError::internal)?;
+    // A failure keeps the handler's own explanation, so whoever looks at the
+    // queue sees why (an outside service refusing, a record that changed).
+    let failure = match tokio::time::timeout(std::time::Duration::from_secs(60), work).await {
+        Ok(Ok(())) => None,
+        Ok(Err(ApiError::Validation(fields))) => {
+            Some(format!("Validation failed: {}", json!(fields)))
         }
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_) => Some("Timed out after 60 seconds".to_owned()),
+    };
+    if let Some(failure) = failure {
+        let failure: String = failure.chars().take(1000).collect();
+        sqlx::query("UPDATE app_tasks SET state=CASE WHEN attempts>=5 THEN 'failed' ELSE 'queued' END,error=$3,available=now()+make_interval(secs=>least(300,power(2,attempts)::int)),lease_until=NULL,updated=now() WHERE id=$1 AND lease_token=$2").bind(id).bind(token).bind(failure).execute(&app.pool).await.map_err(ApiError::internal)?;
     }
     Ok(true)
 }
 
-/// Execute queued tasks one after another until none is due or `budget` has
-/// passed, and return how many ran. A task started near the end of the budget
+/// Queue each scheduled task for the current period, once. Periods are counted
+/// from the Unix epoch in the database's clock, so every runner agrees.
+///
+/// # Errors
+/// Returns database errors.
+pub async fn enqueue_scheduled(app: &App) -> Result<(), ApiError> {
+    for (task, every) in &app.registry.schedules {
+        let seconds = i64::try_from(every.as_secs()).map_err(ApiError::internal)?;
+        sqlx::query("INSERT INTO app_tasks(id,name,idempotency_key,input,actor) VALUES($1,$2,'schedule:'||floor(extract(epoch from now())/$3)::bigint,'{}'::jsonb,'{\"system\":true}'::jsonb) ON CONFLICT(name,idempotency_key) DO NOTHING")
+            .bind(Uuid::new_v4())
+            .bind(task)
+            .bind(seconds)
+            .execute(&app.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    // Finished scheduled runs pile up; a week of them is history enough.
+    sqlx::query("DELETE FROM app_tasks WHERE state='completed' AND idempotency_key LIKE 'schedule:%' AND updated<now()-interval '7 days'")
+        .execute(&app.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+/// Queue the scheduled tasks that are due, then execute queued tasks one after
+/// another until none is due or `budget` has passed, and return how many ran. A task started near the end of the budget
 /// may run for up to 60 seconds more, so give the host that much headroom.
 ///
 /// # Errors
 /// Returns database errors from claiming work.
 pub async fn drain(app: &App, budget: std::time::Duration) -> Result<usize, ApiError> {
     let started = std::time::Instant::now();
+    enqueue_scheduled(app).await?;
     let mut processed = 0;
     while started.elapsed() < budget && tick(app).await? {
         processed += 1;

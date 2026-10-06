@@ -93,6 +93,16 @@ impl Actor {
                     .is_some_and(|rule| matches!(rule, PermissionFilter::All))
             })
     }
+    /// The app itself, for scheduled tasks: every grant, no user id.
+    #[must_use]
+    pub fn system() -> Self {
+        Self {
+            id: String::new(),
+            roles: BTreeSet::from(["authenticated".to_owned()]),
+            is_superuser: true,
+            access: BTreeMap::new(),
+        }
+    }
     /// The actor for a user, marked as a superuser when that user's verified
     /// email is one of `superusers` (case-insensitive).
     #[must_use]
@@ -377,6 +387,8 @@ pub struct Registry {
     pub migrations: BTreeMap<String, String>,
     /// Roles the app ships with, by name: their default access maps.
     pub roles: BTreeMap<String, Value>,
+    /// Tasks run on their own every so often, by task name.
+    pub schedules: BTreeMap<String, std::time::Duration>,
     /// Outside services the app connects to, by name; each is a `providers` record.
     pub integrations: BTreeMap<String, Integration>,
 }
@@ -650,6 +662,26 @@ impl Registry {
             )));
         }
         self.roles.insert(trimmed.into(), permissions);
+        Ok(())
+    }
+    /// Run a registered task on its own every `every` (one minute to one week),
+    /// such as pulling changes from an outside service. Each period queues it
+    /// once, with the idempotency key `schedule:<period number>` and empty
+    /// `data`; it runs as the app itself (`ctx.actor.is_superuser`, empty id).
+    ///
+    /// # Errors
+    /// Rejects unknown or already scheduled tasks and intervals outside that range.
+    pub fn schedule(&mut self, task: &str, every: std::time::Duration) -> Result<(), ApiError> {
+        if !self.tasks.contains_key(task)
+            || self.schedules.contains_key(task)
+            || every < std::time::Duration::from_secs(60)
+            || every > std::time::Duration::from_secs(7 * 24 * 3600)
+        {
+            return Err(ApiError::Parse(format!(
+                "Schedule a registered task once, every one minute to one week: {task}"
+            )));
+        }
+        self.schedules.insert(task.into(), every);
         Ok(())
     }
     /// Register an ordered, append-only SQL migration. Rejects invalid or duplicate migration names.

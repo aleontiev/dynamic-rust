@@ -107,6 +107,18 @@ impl Handler for SlowCall {
     }
 }
 
+/// Records who it ran as, for scheduled runs.
+struct Heartbeat;
+#[handler]
+impl Handler for Heartbeat {
+    async fn run(&self, ctx: &mut Context<'_>, input: Value) -> Result<Value, ApiError> {
+        ctx.create(
+            "events",
+            json!({"name":format!("{}:{}:{}", input["idempotency_key"].as_str().unwrap(), ctx.actor.is_superuser, ctx.actor.id)}),
+        )
+        .await
+    }
+}
 fn registry(service: &str) -> Registry {
     let mut registry = Registry::default();
     let all = ["list", "read", "create", "update", "delete"];
@@ -167,6 +179,7 @@ fn registry(service: &str) -> Registry {
         .unwrap();
     registry.task("fetch_company", FetchCompany).unwrap();
     registry.task("slow_call", SlowCall).unwrap();
+    registry.task("heartbeat", Heartbeat).unwrap();
     registry
         .integration(
             Integration::oauth2("books", "Books Online")
@@ -1121,6 +1134,13 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
             .await
             .unwrap();
     assert_eq!(state_name, "queued", "{error:?}");
+    assert!(
+        error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Token revoked"),
+        "the queue keeps why the task failed: {error:?}"
+    );
     let (_, record) = request(&app, "GET", &detail, &integrator, Value::Null).await;
     assert_eq!(record["provider"]["status"], "error");
     assert!(
@@ -1379,4 +1399,81 @@ fn registry_with_roles(service: &str, roles: &[(&str, Value)]) -> Registry {
         registry.role(name, permissions.clone()).unwrap();
     }
     registry
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn scheduled_tasks_run_once_per_period_as_the_app() {
+    let mut registry = registry("http://127.0.0.1:9");
+    for (task, every) in [
+        ("missing", 60),
+        ("heartbeat", 59),
+        ("heartbeat", 8 * 24 * 3600),
+    ] {
+        assert!(
+            registry.schedule(task, Duration::from_secs(every)).is_err(),
+            "{task} {every}"
+        );
+    }
+    registry
+        .schedule("heartbeat", Duration::from_secs(300))
+        .unwrap();
+    assert!(
+        registry
+            .schedule("heartbeat", Duration::from_secs(600))
+            .is_err()
+    );
+    let pool = isolated_pool("schedules").await;
+    registry.migrate(&pool).await.unwrap();
+    let app = App {
+        pool: pool.clone(),
+        registry: Arc::new(registry),
+        name: "Procurement".into(),
+        origin: "https://example.com".into(),
+        preview_origins: vec![],
+        mail_from: "noreply@example.com".into(),
+        mail_region: "us-east-1".into(),
+        mail_api_key: None,
+        google_auth: None,
+        branding: json!({}),
+        mail_endpoint: None,
+        revision: "test".into(),
+        superusers: dynamic_rust::application::parse_superusers(""),
+        operator_secret: None,
+    };
+    assert_eq!(
+        task_runner::drain(&app, Duration::from_secs(5))
+            .await
+            .unwrap(),
+        1
+    );
+    // The same period queues nothing new.
+    assert_eq!(
+        task_runner::drain(&app, Duration::from_secs(5))
+            .await
+            .unwrap(),
+        0
+    );
+    let ran: Vec<String> =
+        sqlx::query_scalar("SELECT data->>'name' FROM app_records WHERE kind='events'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ran.len(), 1);
+    assert!(ran[0].starts_with("schedule:"), "{ran:?}");
+    assert!(
+        ran[0].ends_with(":true:"),
+        "runs as the app itself: {ran:?}"
+    );
+    // A finished run older than a week is cleared away.
+    sqlx::query("UPDATE app_tasks SET updated=now()-interval '8 days'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    task_runner::enqueue_scheduled(&app).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM app_tasks WHERE state='completed'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
 }

@@ -273,6 +273,13 @@ External effects are at-least-once: pass the same idempotency key to the
 external provider. This queue is for app business tasks, not a platform's
 project/agent messages.
 
+`registry.schedule("pull_vendors", Duration::from_secs(900))` runs a
+registered task on its own every period (one minute to one week): `drain`
+queues it once per period, keyed `schedule:<period number>`, with empty
+`data`, and it runs as the app itself (`ctx.actor.is_superuser`, an empty
+`ctx.actor.id`). A failed task keeps its handler's error message in
+`app_tasks.error` while it is retried.
+
 A task does not hold the application write lock until its first write through
 the context, so calls to outside services made before it do not hold up the
 app's users. Call `context.lock().await?` first when a later write depends on
