@@ -906,6 +906,41 @@ pub fn configured(
         operator_secret: operator::secret_from_env()?,
     })
 }
+/// The core records a new app database starts with: a Viewer role and the
+/// email sign-in provider. Seeded once: administrators may edit or remove
+/// them, and a redeploy must not undo that. The first Viewer predates access
+/// maps; its map named no resource and granted nothing, so an untouched one is
+/// brought up to date.
+async fn seed(pool: &PgPool) -> Result<(), ApiError> {
+    let legacy_viewer = json!({"name":"Viewer","permissions":{"list":true,"read":true,"create":false,"update":false,"delete":false}});
+    let read = json!({"list":true,"read":true});
+    for (id, kind, data, replaces) in [
+        (
+            "00000000-0000-0000-0000-000000000001",
+            "roles",
+            json!({"name":"Viewer","permissions":{"users":read,"roles":read,"providers":read}}),
+            legacy_viewer,
+        ),
+        (
+            "00000000-0000-0000-0000-000000000002",
+            "providers",
+            json!({"name":"Email sign-in","kind":"email_magic_link","enabled":true}),
+            Value::Null,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO app_records(id,kind,data) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,updated=now() WHERE app_records.data=$4",
+        )
+        .bind(Uuid::parse_str(id).unwrap())
+        .bind(kind)
+        .bind(data)
+        .bind(replaces)
+        .execute(pool)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    Ok(())
+}
 async fn bootstrap() -> Result<(), ApiError> {
     let get = |name| std::env::var(name).map_err(ApiError::internal);
     let name = get("APP_DATABASE")?;
@@ -978,28 +1013,7 @@ async fn bootstrap() -> Result<(), ApiError> {
         .execute(&pool)
         .await
         .map_err(ApiError::internal)?;
-    for (id, kind, data) in [
-        (
-            "00000000-0000-0000-0000-000000000001",
-            "roles",
-            json!({"name":"Viewer","permissions":{"list":true,"read":true,"create":false,"update":false,"delete":false}}),
-        ),
-        (
-            "00000000-0000-0000-0000-000000000002",
-            "providers",
-            json!({"name":"Email sign-in","kind":"email_magic_link","enabled":true}),
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO app_records(id,kind,data) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,updated=now()",
-        )
-        .bind(Uuid::parse_str(id).unwrap())
-        .bind(kind)
-        .bind(data)
-        .execute(&pool)
-        .await
-        .map_err(ApiError::internal)?;
-    }
+    seed(&pool).await?;
     pool.close().await;
     Ok(())
 }
