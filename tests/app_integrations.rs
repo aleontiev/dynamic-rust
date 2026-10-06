@@ -491,6 +491,9 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
         json!({"name":"PO-1"}),
     )
     .await;
+    // A field the record does not hold yet comes back as null, not missing.
+    assert!(order["order"].as_object().unwrap().contains_key("note"));
+    assert!(order["order"]["note"].is_null());
     let order_id = order["order"]["id"].as_str().unwrap().to_owned();
     let run = |name: &str| format!("/api/admin/orders/{order_id}/actions/{name}/");
     assert_eq!(

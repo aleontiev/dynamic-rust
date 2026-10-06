@@ -1019,11 +1019,16 @@ impl<'a> Context<'a> {
             .bind(Uuid::new_v4()).bind(task).bind(key).bind(input).bind(json!({"id":self.actor.id})).fetch_optional(&mut *self.connection).await.map_err(ApiError::internal)?.ok_or_else(|| ApiError::Conflict("Idempotency key already belongs to different task input or actor".into()))
     }
 }
+/// A record as people see it: every readable field, `null` where it holds no
+/// value, so clients can tell an empty field from one they have not loaded.
 fn output(resource: &Resource, mut value: Value) -> Value {
-    value
-        .as_object_mut()
-        .unwrap()
-        .retain(|name, _| resource.field(name).is_some_and(|f| !f.write_only));
+    let object = value.as_object_mut().unwrap();
+    object.retain(|name, _| resource.field(name).is_some_and(|f| !f.write_only));
+    for field in &resource.fields {
+        if !field.write_only && !field.deferred && !object.contains_key(&field.name) {
+            object.insert(field.name.clone(), Value::Null);
+        }
+    }
     value
 }
 /// Every id a relation field holds must name an existing record the actor may

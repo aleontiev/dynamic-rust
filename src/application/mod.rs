@@ -164,6 +164,10 @@ fn public_record(kind: &str, mut record: Value) -> Value {
             object.insert("roles".into(), roles);
         }
         object.retain(|name, _| fields(kind).iter().any(|(field, _)| field == name));
+        // Every public field, `null` when unset: an absent one reads as not loaded yet.
+        for (field, _) in fields(kind) {
+            object.entry(field).or_insert(Value::Null);
+        }
     }
     record
 }
