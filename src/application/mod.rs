@@ -17,6 +17,7 @@ use uuid::Uuid;
 mod extension_api;
 pub mod extensions;
 pub mod integrations;
+mod storage;
 pub mod task_runner;
 /// The HTTP client library behind [`extensions::Context::http`] and
 /// integrations, for building requests and reading responses.

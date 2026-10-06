@@ -17,7 +17,7 @@ use dynamic_rust::{
     ApiError, FieldKind,
     application::{
         App,
-        extensions::{Context, Handler, Hook, Integration, Model, Registry, handler},
+        extensions::{Context, Handler, Hook, Integration, Model, Registry, Storage, handler},
         router, task_runner,
     },
 };
@@ -119,8 +119,9 @@ impl Handler for Heartbeat {
         .await
     }
 }
-fn registry(service: &str) -> Registry {
+fn registry(service: &str, storage: Storage) -> Registry {
     let mut registry = Registry::default();
+    registry.storage(storage);
     let all = ["list", "read", "create", "update", "delete"];
     registry
         .model(
@@ -196,7 +197,7 @@ fn registry(service: &str) -> Registry {
 
 #[test]
 fn describing_actions_and_integrations_rejects_mistakes() {
-    let mut registry = registry("http://127.0.0.1:9");
+    let mut registry = registry("http://127.0.0.1:9", Storage::Records);
     for (name, details) in [
         ("missing", json!({"label":"Nope"})),
         ("approve", json!({"colour":"red"})),
@@ -391,7 +392,15 @@ async fn isolated_pool(prefix: &str) -> PgPool {
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
-async fn actions_integrations_and_outside_calls_follow_roles() {
+async fn actions_integrations_and_outside_calls_follow_roles_in_records() {
+    actions_integrations_and_outside_calls_follow_roles(Storage::Records).await;
+}
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn actions_integrations_and_outside_calls_follow_roles_in_tables() {
+    actions_integrations_and_outside_calls_follow_roles(Storage::Tables).await;
+}
+async fn actions_integrations_and_outside_calls_follow_roles(storage: Storage) {
     let service: Shared = Arc::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -403,7 +412,7 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
 
     let pool = isolated_pool("integrations").await;
-    let registry = registry(&base);
+    let registry = registry(&base, storage);
     registry.migrate(&pool).await.unwrap();
     registry.migrate(&pool).await.unwrap();
     let mut users = BTreeMap::new();
@@ -1030,10 +1039,13 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
         .await
         .unwrap();
     }
-    async fn events(pool: &PgPool) -> Vec<String> {
-        sqlx::query_scalar(
-            "SELECT data->>'name' FROM app_records WHERE kind='events' ORDER BY created",
-        )
+    async fn events(pool: &PgPool, storage: Storage) -> Vec<String> {
+        sqlx::query_scalar(match storage {
+            Storage::Records => {
+                "SELECT data->>'name' FROM app_records WHERE kind='events' ORDER BY created"
+            }
+            Storage::Tables => "SELECT name FROM events ORDER BY created",
+        })
         .fetch_all(pool)
         .await
         .unwrap()
@@ -1062,7 +1074,10 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
         2,
         "drain runs every due task"
     );
-    assert_eq!(events(&pool).await, vec!["first:Acme", "second:Acme"]);
+    assert_eq!(
+        events(&pool, storage).await,
+        vec!["first:Acme", "second:Acme"]
+    );
     assert_eq!(
         service.lock().unwrap().authorization,
         vec!["Bearer access-1", "Bearer access-1"]
@@ -1094,7 +1109,7 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
             .unwrap(),
         1
     );
-    assert_eq!(events(&pool).await.last().unwrap(), "third:Acme");
+    assert_eq!(events(&pool, storage).await.last().unwrap(), "third:Acme");
     let (access, refresh): (String, String) = sqlx::query_as(
         "SELECT access_token,refresh_token FROM app_integration_secrets WHERE provider='books'",
     )
@@ -1149,7 +1164,11 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
             .unwrap()
             .contains("Token revoked")
     );
-    assert!(!events(&pool).await.contains(&"fourth:Acme".to_owned()));
+    assert!(
+        !events(&pool, storage)
+            .await
+            .contains(&"fourth:Acme".to_owned())
+    );
     sqlx::query("DELETE FROM app_tasks WHERE idempotency_key='fourth'")
         .execute(&pool)
         .await
@@ -1251,8 +1270,14 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     .await
     .expect("a task waiting on an outside service must not block other writers");
     assert_eq!(drained.unwrap(), 1);
-    assert_eq!(events(&pool).await.last().unwrap(), "slow:201 Created");
-    let written: i64 = sqlx::query_scalar("SELECT count(*) FROM app_records WHERE kind='suppliers' AND data->>'name'='Written meanwhile'")
+    assert_eq!(
+        events(&pool, storage).await.last().unwrap(),
+        "slow:201 Created"
+    );
+    let written: i64 = sqlx::query_scalar(match storage {
+        Storage::Records => "SELECT count(*) FROM app_records WHERE kind='suppliers' AND data->>'name'='Written meanwhile'",
+        Storage::Tables => "SELECT count(*) FROM suppliers WHERE name='Written meanwhile'",
+    })
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1261,10 +1286,18 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
-async fn shipped_roles_are_checked_created_and_keep_an_administrators_changes() {
+async fn shipped_roles_are_checked_created_and_keep_an_administrators_changes_in_records() {
+    shipped_roles_are_checked_created_and_keep_an_administrators_changes(Storage::Records).await;
+}
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn shipped_roles_are_checked_created_and_keep_an_administrators_changes_in_tables() {
+    shipped_roles_are_checked_created_and_keep_an_administrators_changes(Storage::Tables).await;
+}
+async fn shipped_roles_are_checked_created_and_keep_an_administrators_changes(storage: Storage) {
     let pool = isolated_pool("shipped_roles").await;
     let base = "http://127.0.0.1:9";
-    let mut registry = registry(base);
+    let mut registry = registry(base, storage);
     for name in ["", "authenticated", "*", "admin", " ADMIN "] {
         assert!(registry.role(name, json!({})).is_err(), "{name:?}");
     }
@@ -1364,6 +1397,7 @@ async fn shipped_roles_are_checked_created_and_keep_an_administrators_changes() 
     // narrowed Auditor keeps the administrator's version.
     let mut next = registry_with_roles(
         base,
+        storage,
         &[
             (
                 "Clerk",
@@ -1387,14 +1421,14 @@ async fn shipped_roles_are_checked_created_and_keep_an_administrators_changes() 
         json!({"orders":{"read":{"colour":"red"}}}),
         json!({"users":{"list":{"name":"x"}}}),
     ] {
-        next = registry_with_roles(base, &[("Broken", wrong.clone())]);
+        next = registry_with_roles(base, storage, &[("Broken", wrong.clone())]);
         let error = next.migrate(&pool).await.unwrap_err();
         assert!(error.to_string().contains("Broken"), "{wrong} {error}");
     }
 }
 
-fn registry_with_roles(service: &str, roles: &[(&str, Value)]) -> Registry {
-    let mut registry = registry(service);
+fn registry_with_roles(service: &str, storage: Storage, roles: &[(&str, Value)]) -> Registry {
+    let mut registry = registry(service, storage);
     for (name, permissions) in roles {
         registry.role(name, permissions.clone()).unwrap();
     }
@@ -1403,8 +1437,16 @@ fn registry_with_roles(service: &str, roles: &[(&str, Value)]) -> Registry {
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
-async fn scheduled_tasks_run_once_per_period_as_the_app() {
-    let mut registry = registry("http://127.0.0.1:9");
+async fn scheduled_tasks_run_once_per_period_as_the_app_in_records() {
+    scheduled_tasks_run_once_per_period_as_the_app(Storage::Records).await;
+}
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn scheduled_tasks_run_once_per_period_as_the_app_in_tables() {
+    scheduled_tasks_run_once_per_period_as_the_app(Storage::Tables).await;
+}
+async fn scheduled_tasks_run_once_per_period_as_the_app(storage: Storage) {
+    let mut registry = registry("http://127.0.0.1:9", storage);
     for (task, every) in [
         ("missing", 60),
         ("heartbeat", 59),
@@ -1454,11 +1496,13 @@ async fn scheduled_tasks_run_once_per_period_as_the_app() {
             .unwrap(),
         0
     );
-    let ran: Vec<String> =
-        sqlx::query_scalar("SELECT data->>'name' FROM app_records WHERE kind='events'")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+    let ran: Vec<String> = sqlx::query_scalar(match storage {
+        Storage::Records => "SELECT data->>'name' FROM app_records WHERE kind='events'",
+        Storage::Tables => "SELECT name FROM events",
+    })
+    .fetch_all(&pool)
+    .await
+    .unwrap();
     assert_eq!(ran.len(), 1);
     assert!(ran[0].starts_with("schedule:"), "{ran:?}");
     assert!(

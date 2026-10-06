@@ -161,11 +161,90 @@ admin shows for a model in the navigation drawer, on its pages, and on every
 field of another model that references it, so a `borrower` relation carries the
 borrower model's icon rather than a generic one. Without it the admin uses
 `table`. Unique field combinations reject duplicates.
-Models store validated JSON records; additive model fields do not require ALTER
-TABLE. Use `registry.migration("001_backfill", SQL)` for data migrations and custom
-indexes. Applied migration SQL cannot change. Migrations run with the app role,
-never a shared-database administrator. Business writes serialize per app database;
-this deliberately favors transaction correctness over high write concurrency.
+By default models store validated JSON records in one shared table, and additive
+model fields do not require ALTER TABLE; a model can instead keep a table of its
+own (see [Storage](#storage)). Use `registry.migration("001_backfill", SQL)` for
+data migrations and custom indexes. Applied migration SQL cannot change.
+Migrations run with the app role, never a shared-database administrator. Business
+writes serialize per app database; this deliberately favors transaction
+correctness over high write concurrency.
+
+## Storage
+
+Each registered model keeps its records in one of two ways:
+
+- **`Storage::Records`** (the default): JSON documents in the shared
+  `app_records` table (`id`, `kind`, `data`, `created`, `updated`). Adding,
+  removing or retyping a field needs no migration. The runtime itself checks
+  types, required fields, relations, uniqueness and references.
+- **`Storage::Tables`**: a table named after the model's plural, with a typed
+  column per field. The database then enforces the schema as well: `NOT NULL`
+  for required fields, a foreign key per relation, a join table per
+  many-relation, and a unique index per `.unique(...)`. Plain SQL can report on
+  it.
+
+Choose per model, or set a default for every model that does not choose:
+
+```rust
+registry.storage(Storage::Tables);                 // every model without its own choice
+registry.model(Model::new("events", "event")       // this one stays in app_records
+    .storage(Storage::Records)
+    .field("name", FieldKind::String))?;
+```
+
+The API, permissions, hooks, actions, tasks, filters and the admin behave the
+same either way; records are JSON documents to all of them. A table's columns
+are typed:
+
+| Field kind | Column |
+|---|---|
+| string, email, file, duration | `text` |
+| integer | `bigint` |
+| decimal, money | `numeric` |
+| float | `double precision` |
+| boolean | `boolean` |
+| date / datetime / time | `date` / `timestamptz` / `time` |
+| json | `jsonb` |
+| uuid, relation | `uuid` |
+| many-relation | join table `<model>__<field>(record, position, target)` |
+
+Every table also has `id uuid PRIMARY KEY`, `created` and `updated`. A relation
+to another model gets a foreign key to that model's table, or to `app_records`
+when the target keeps records there. A relation to a built-in resource (`users`
+and the like) gets none, so people can still be removed. A join table keeps a
+many-relation's order, removes its rows with the record (`ON DELETE CASCADE`),
+and checks its targets with a foreign key when they are model records. In table storage, filters and sorts compare
+numbers, dates and times by their type. A value of the wrong form (`"next
+tuesday"` for a date) answers 400 instead of being stored. Model names
+starting with `app_` or `pg_` are reserved for the runtime's tables.
+
+**How a table evolves.** `registry.migrate` compares the code with the schema it
+recorded last time, in `app_model_tables`:
+
+1. Before the app's own migrations it creates new tables, adds a column for each
+   new field, and moves any records the model kept in `app_records` into its
+   table, typed. A record that does not fit stops the migration and changes
+   nothing. Foreign keys and unique indexes are added. A foreign key holds for
+   new rows at once and is checked against older rows once they allow it.
+   Existing duplicates leave a unique index for a later release, while the
+   runtime still refuses new ones.
+2. Then the app's `registry.migration`s run.
+3. Then it checks the result. A field whose column has another type than the
+   code declares, a declared field without a column, and a field the code no
+   longer declares whose column or join table still exists each stop the
+   migration. The error names the SQL to put in a `registry.migration`
+   (`ALTER TABLE orders ALTER COLUMN quantity TYPE numeric USING ...`,
+   `ALTER TABLE orders DROP COLUMN region`), so data is only converted or
+   dropped on purpose. A required field becomes `NOT NULL` once no row lacks
+   it. Until then older rows keep the column nullable, and writes still
+   require a value. A model that leaves table storage, or the app, while its
+   table still holds records also stops the migration.
+
+**Which to choose.** Records storage suits apps whose fields change often and
+whose data is modest: nothing to migrate, ever. Table storage suits data people
+report on with SQL or other tools, large volumes that need ordinary indexes, and
+schemas worth having the database guarantee. The price is a migration whenever a
+field's type changes or a field goes away.
 
 CRUD routes are `/api/admin/suppliers/` and `/api/admin/suppliers/UUID/`. POST and
 PATCH accept plain JSON or a singular envelope (`{"supplier":{...}}`). OPTIONS

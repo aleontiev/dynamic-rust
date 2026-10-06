@@ -1,8 +1,9 @@
 #![allow(clippy::items_after_statements, clippy::map_unwrap_or)]
 //! Registered, transaction-backed application extensions. All writes, hooks,
 //! actions and task effects share a transaction. No cloud credentials are needed.
-use super::DOCUMENT;
 pub use super::integrations::{Connection, Integration};
+use super::storage;
+pub use super::storage::Storage;
 use crate::{
     AccessMap, AccessTargets, ApiError, Field, FieldKind, PermissionFilter, Principal,
     QueryFeatures, RelationLink, Resource,
@@ -199,6 +200,9 @@ pub struct Model {
     pub hook: Option<Arc<dyn Hook>>,
     /// Unique field combinations; enforced inside the application write lock.
     pub unique: Vec<Vec<String>>,
+    /// Where the model keeps its records; `None` follows the registry's choice
+    /// ([`Registry::storage`]), which is [`Storage::Records`] unless changed.
+    pub storage: Option<Storage>,
 }
 impl Model {
     pub fn new(plural: &str, singular: &str) -> Self {
@@ -233,6 +237,7 @@ impl Model {
             resource,
             hook: None,
             unique: vec![],
+            storage: None,
         }
         .field("id", FieldKind::Uuid)
         .readonly("id")
@@ -299,6 +304,14 @@ impl Model {
         if let Some(f) = self.resource.fields.iter_mut().find(|f| f.name == name) {
             f.read_only = true;
         }
+        self
+    }
+    /// Keep this model's records in `storage` whatever the registry's default:
+    /// [`Storage::Tables`] gives it a table of its own, named after its plural,
+    /// with a typed column per field.
+    pub fn storage(mut self, storage: Storage) -> Self {
+        self.storage = Some(storage);
+        self.resource.table = storage::table_for(storage, &self.resource.plural_name);
         self
     }
     pub fn relation(mut self, name: &str, target: &str) -> Self {
@@ -391,6 +404,8 @@ pub struct Registry {
     pub schedules: BTreeMap<String, std::time::Duration>,
     /// Outside services the app connects to, by name; each is a `providers` record.
     pub integrations: BTreeMap<String, Integration>,
+    /// Where models keep their records unless they choose ([`Model::storage`]).
+    pub default_storage: Storage,
 }
 impl Registry {
     /// A model's resource with the actor's stored roles merged into its grants.
@@ -444,11 +459,26 @@ impl Registry {
             })
             .collect()
     }
+    /// Keep the records of every model that does not choose its own storage in
+    /// `storage`, including models registered before this call. The default is
+    /// [`Storage::Records`]; [`Storage::Tables`] gives each model a table.
+    pub fn storage(&mut self, storage: Storage) {
+        self.default_storage = storage;
+        for model in self.models.values_mut() {
+            if model.storage.is_none() {
+                model.resource.table = storage::table_for(storage, &model.resource.plural_name);
+            }
+        }
+    }
     /// Register a model. Rejects reserved/duplicate names, invalid fields and invalid unique constraints.
     ///
     /// # Errors
     /// Rejects reserved/duplicate names, invalid fields and invalid unique constraints.
-    pub fn model(&mut self, model: Model) -> Result<(), ApiError> {
+    pub fn model(&mut self, mut model: Model) -> Result<(), ApiError> {
+        if model.storage.is_none() {
+            model.resource.table =
+                storage::table_for(self.default_storage, &model.resource.plural_name);
+        }
         let name = &model.resource.plural_name;
         if !identifier(name)
             || super::KINDS.contains(&name.as_str())
@@ -713,6 +743,9 @@ impl Registry {
         super::core::ensure_admin_role(&mut tx, self).await?;
         super::integrations::sync_providers(&mut tx, &self.integrations).await?;
         super::core::ensure_roles(&mut tx, self).await?;
+        // Tables and new columns exist before the app's own migrations run,
+        // which may convert data; the schema is checked once they have.
+        storage::prepare(&mut tx, self).await?;
         for (name, sql) in &self.migrations {
             let digest = super::hash(sql);
             let prior: Option<String> =
@@ -740,6 +773,7 @@ impl Registry {
                 .await
                 .map_err(ApiError::internal)?;
         }
+        storage::verify(&mut tx, self).await?;
         tx.commit().await.map_err(ApiError::internal)
     }
 }
@@ -889,19 +923,14 @@ impl<'a> Context<'a> {
     /// Rejects missing records, missing permissions and database failures.
     pub async fn get(&mut self, kind: &str, id: Uuid) -> Result<Value, ApiError> {
         let resource = self.effective(kind, "read")?;
-        let mut query = QueryBuilder::<Postgres>::new(format!(
-            "SELECT {DOCUMENT} FROM app_records WHERE kind="
-        ));
-        query
-            .push_bind(kind.to_owned())
-            .push(" AND id=")
-            .push_bind(id);
+        let mut query = storage::select_documents(&resource);
+        query.push(" AND id=").push_bind(id);
         row_filter(&mut query, &resource)?;
         let row: Value = query
             .build_query_scalar()
             .fetch_optional(&mut *self.connection)
             .await
-            .map_err(ApiError::internal)?
+            .map_err(storage::database_error)?
             .ok_or(ApiError::NotFound)?;
         Ok(output(&resource, row))
     }
@@ -915,19 +944,16 @@ impl<'a> Context<'a> {
         features: &QueryFeatures,
     ) -> Result<(Vec<Value>, u64), ApiError> {
         let resource = self.effective(kind, "list")?;
-        let mut count =
-            QueryBuilder::<Postgres>::new("SELECT count(*) FROM app_records WHERE kind=");
-        count.push_bind(kind.to_owned());
+        let mut count = storage::select_count(&resource);
         query_filters(&mut count, &resource, features)?;
+        // A filter value of the wrong form (a date that is not one) is the
+        // caller's mistake, not the server's.
         let total: i64 = count
             .build_query_scalar()
             .fetch_one(&mut *self.connection)
             .await
-            .map_err(ApiError::internal)?;
-        let mut query = QueryBuilder::<Postgres>::new(format!(
-            "SELECT {DOCUMENT} FROM app_records WHERE kind="
-        ));
-        query.push_bind(kind.to_owned());
+            .map_err(storage::database_error)?;
+        let mut query = storage::select_documents(&resource);
         query_filters(&mut query, &resource, features)?;
         query.push(" ORDER BY ");
         for sort in &features.sort {
@@ -943,7 +969,7 @@ impl<'a> Context<'a> {
             .build_query_scalar()
             .fetch_all(&mut *self.connection)
             .await
-            .map_err(ApiError::internal)?;
+            .map_err(storage::database_error)?;
         Ok((
             rows.into_iter().map(|row| output(&resource, row)).collect(),
             u64::try_from(total).map_err(ApiError::internal)?,
@@ -989,13 +1015,8 @@ impl<'a> Context<'a> {
             let previous = if operation == "create" {
                 None
             } else {
-                let mut query = QueryBuilder::<Postgres>::new(format!(
-                    "SELECT {DOCUMENT} FROM app_records WHERE kind="
-                ));
-                query
-                    .push_bind(kind.to_owned())
-                    .push(" AND id=")
-                    .push_bind(id);
+                let mut query = storage::select_documents(&resource);
+                query.push(" AND id=").push_bind(id);
                 row_filter(&mut query, &resource)?;
                 Some(
                     query
@@ -1033,32 +1054,37 @@ impl<'a> Context<'a> {
                 .await
                 .map_err(ApiError::internal)?;
             self.depth += 1;
-            let result=async {
-                if let Some(hook)=&model.hook { hook.before(self,operation,previous.as_ref(),&mut record).await?; }
-                if record["id"]!=json!(id) { return Err(ApiError::Parse("Hooks cannot change record identity".into())); }
-                if operation=="delete" {
-                    for related in self.registry.models.values() {
-                        for field in &related.resource.fields {
-                            if field.related_resource.as_deref()==Some(kind) {
-                                let sql=if field.many {"SELECT EXISTS(SELECT 1 FROM app_records WHERE kind=$1 AND data->$2 @> to_jsonb($3::text))"} else {"SELECT EXISTS(SELECT 1 FROM app_records WHERE kind=$1 AND data->>$2=$3)"};
-                                let used:bool=sqlx::query_scalar(sql).bind(&related.resource.plural_name).bind(&field.name).bind(id.to_string()).fetch_one(&mut *self.connection).await.map_err(ApiError::internal)?;
-                                if used { return Err(ApiError::Conflict("This record is still referenced".into())); }
-                            }
-                        }
-                    }
-                    sqlx::query("DELETE FROM app_records WHERE kind=$1 AND id=$2").bind(kind).bind(id).execute(&mut *self.connection).await.map_err(ApiError::internal)?;
+            let result = async {
+                if let Some(hook) = &model.hook {
+                    hook.before(self, operation, previous.as_ref(), &mut record)
+                        .await?;
+                }
+                if record["id"] != json!(id) {
+                    return Err(ApiError::Parse(
+                        "Hooks cannot change record identity".into(),
+                    ));
+                }
+                if operation == "delete" {
+                    self.refuse_if_referenced(kind, id).await?;
+                    storage::remove(&mut *self.connection, &resource, id).await?;
                 } else {
-                    validate_record(self,&model,&record).await?;
+                    validate_record(self, &model, &record).await?;
                     // Check proposed ownership as well as existing ownership.
                     // Role filters cannot be bypassed by reassigning a row.
-                    check_proposed_scope(&resource,&record)?;
-                    let mut data=record.clone();
-                    for reserved in ["id","created","updated"] { data.as_object_mut().unwrap().remove(reserved); }
-                    record=sqlx::query_scalar(&format!("INSERT INTO app_records(id,kind,data) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,updated=now() RETURNING {DOCUMENT}")).bind(id).bind(kind).bind(data).fetch_one(&mut *self.connection).await.map_err(ApiError::internal)?;
+                    check_proposed_scope(&resource, &record)?;
+                    let mut data = record.clone();
+                    for reserved in ["id", "created", "updated"] {
+                        data.as_object_mut().unwrap().remove(reserved);
+                    }
+                    record = storage::save(&mut *self.connection, &resource, id, &data).await?;
                 }
-                if let Some(hook)=&model.hook { hook.after(self,operation,previous.as_ref(),&record).await?; }
-                Ok(output(&resource,record))
-            }.await;
+                if let Some(hook) = &model.hook {
+                    hook.after(self, operation, previous.as_ref(), &record)
+                        .await?;
+                }
+                Ok(output(&resource, record))
+            }
+            .await;
             self.depth -= 1;
             if result.is_err() {
                 sqlx::query(&format!("ROLLBACK TO SAVEPOINT {savepoint}"))
@@ -1072,6 +1098,20 @@ impl<'a> Context<'a> {
                 .map_err(ApiError::internal)?;
             result
         })
+    }
+    /// A record other records still point at cannot be deleted.
+    async fn refuse_if_referenced(&mut self, kind: &str, id: Uuid) -> Result<(), ApiError> {
+        for related in self.registry.models.values() {
+            for field in &related.resource.fields {
+                if field.related_resource.as_deref() == Some(kind)
+                    && storage::referenced(&mut *self.connection, &related.resource, field, id)
+                        .await?
+                {
+                    return Err(ApiError::Conflict("This record is still referenced".into()));
+                }
+            }
+        }
+        Ok(())
     }
     /// Queue work atomically with the current write. Rejects unknown handlers, invalid keys, reused keys with different input, or database failures.
     ///
@@ -1115,13 +1155,8 @@ async fn validate_references(
         _ => vec![Uuid::parse_str(value.as_str().unwrap_or_default()).map_err(ApiError::internal)?],
     };
     for id in ids {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM app_records WHERE kind=$1 AND id=$2)")
-                .bind(target)
-                .bind(id)
-                .fetch_one(&mut *context.connection)
-                .await
-                .map_err(ApiError::internal)?;
+        let exists =
+            storage::exists(&mut *context.connection, context.registry, target, id).await?;
         if !exists {
             return Err(ApiError::Parse(format!(
                 "Unknown related record: {}",
@@ -1186,26 +1221,7 @@ async fn validate_record(
         if unique.iter().any(|field| record[field].is_null()) {
             continue;
         }
-        let mut query =
-            QueryBuilder::<Postgres>::new("SELECT EXISTS(SELECT 1 FROM app_records WHERE kind=");
-        query
-            .push_bind(model.resource.plural_name.clone())
-            .push(" AND id<>")
-            .push_bind(Uuid::parse_str(record["id"].as_str().unwrap()).unwrap());
-        for field in unique {
-            query
-                .push(" AND data->")
-                .push_bind(field.clone())
-                .push(" = ")
-                .push_bind(record[field].clone());
-        }
-        query.push(")");
-        if query
-            .build_query_scalar::<bool>()
-            .fetch_one(&mut *context.connection)
-            .await
-            .map_err(ApiError::internal)?
-        {
+        if storage::duplicate(&mut *context.connection, &model.resource, record, unique).await? {
             return Err(ApiError::Conflict(format!(
                 "Duplicate {}",
                 unique.join(", ")
@@ -1222,17 +1238,7 @@ fn expression(
     let field = resource
         .field(name)
         .ok_or_else(|| ApiError::Parse("Unknown filter/sort field".into()))?;
-    if ["id", "created", "updated"].contains(&name) {
-        query.push(format!("{name}::text"));
-    } else {
-        query.push("(data->>").push_bind(name.to_owned()).push(")");
-        if matches!(
-            field.kind,
-            FieldKind::Integer | FieldKind::Decimal | FieldKind::Float | FieldKind::Money
-        ) {
-            query.push("::numeric");
-        }
-    }
+    storage::push_column(query, resource, field, true);
     Ok(())
 }
 fn query_filters(
@@ -1268,8 +1274,8 @@ fn query_filters(
             if i > 0 {
                 query.push(" OR ");
             }
-            expression(query, resource, &filter.field)?;
             use crate::FilterOperator as F;
+            storage::push_column(query, resource, field, filter.operator != F::IContains);
             query.push(match filter.operator {
                 F::Eq | F::In => " = ",
                 F::Gt => " > ",
@@ -1298,7 +1304,7 @@ fn query_filters(
                         .replace('_', "\\_")
                 ));
             } else {
-                query.push_bind(value.clone());
+                storage::push_value(query, resource, field, value.clone());
             }
         }
         query.push(")");
@@ -1372,15 +1378,9 @@ fn condition(
         field.kind,
         FieldKind::Integer | FieldKind::Decimal | FieldKind::Float | FieldKind::Money
     ) && operator != "icontains";
+    let typed = operator != "icontains";
     let column = |query: &mut QueryBuilder<'_, Postgres>| {
-        if ["id", "created", "updated"].contains(&name) {
-            query.push(format!("{name}::text"));
-        } else {
-            query.push("(data->>").push_bind(name.to_owned()).push(")");
-            if numeric {
-                query.push("::numeric");
-            }
-        }
+        storage::push_column(query, resource, field, typed);
     };
     if operator == "isnull" {
         column(query);
@@ -1437,7 +1437,8 @@ fn condition(
             ));
         } else {
             column(query);
-            query.push(comparison).push_bind(text);
+            query.push(comparison);
+            storage::push_value(query, resource, field, text);
         }
     }
     query.push(")");

@@ -13,7 +13,7 @@ use dynamic_rust::{
     ApiError, FieldKind, PermissionFilter,
     application::{
         App,
-        extensions::{Actor, Context, Handler, Hook, Model, Registry, handler},
+        extensions::{Actor, Context, Handler, Hook, Model, Registry, Storage, handler},
         router, task_runner,
     },
 };
@@ -101,8 +101,9 @@ impl Handler for ReceiptTask {
             .await
     }
 }
-fn registry() -> Registry {
+fn registry(storage: Storage) -> Registry {
     let mut registry = Registry::default();
+    registry.storage(storage);
     let all = ["list", "read", "create", "update", "delete"];
     registry
         .model(
@@ -212,7 +213,15 @@ async fn request(
 }
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
-async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
+async fn custom_models_actions_hooks_permissions_tasks_and_persistence_in_records() {
+    custom_models_actions_hooks_permissions_tasks_and_persistence(Storage::Records).await;
+}
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn custom_models_actions_hooks_permissions_tasks_and_persistence_in_tables() {
+    custom_models_actions_hooks_permissions_tasks_and_persistence(Storage::Tables).await;
+}
+async fn custom_models_actions_hooks_permissions_tasks_and_persistence(storage: Storage) {
     let url = std::env::var("DREAM_TEST_DATABASE_URL").unwrap();
     let admin = PgPool::connect(&url).await.unwrap();
     let schema = format!("extensions_{}", Uuid::new_v4().simple());
@@ -233,7 +242,7 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
         .connect(&url)
         .await
         .unwrap();
-    let registry = registry();
+    let registry = registry(storage);
     registry.migrate(&pool).await.unwrap();
     registry.migrate(&pool).await.unwrap();
     let buyer = Uuid::new_v4();
@@ -647,7 +656,15 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
 /// the API by superusers and by anyone a role lets manage them.
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL"]
-async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() {
+async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api_in_records() {
+    stored_roles_grant_access_at_runtime_and_are_managed_through_the_api(Storage::Records).await;
+}
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api_in_tables() {
+    stored_roles_grant_access_at_runtime_and_are_managed_through_the_api(Storage::Tables).await;
+}
+async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api(storage: Storage) {
     let url = std::env::var("DREAM_TEST_DATABASE_URL").unwrap();
     let admin = PgPool::connect(&url).await.unwrap();
     let schema = format!("roles_{}", Uuid::new_v4().simple());
@@ -668,7 +685,7 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         .connect(&url)
         .await
         .unwrap();
-    let registry = registry();
+    let registry = registry(storage);
     registry.migrate(&pool).await.unwrap();
     let owner = Uuid::new_v4();
     let clerk = Uuid::new_v4();
@@ -984,7 +1001,7 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         .0,
         403
     );
-    sqlx::query("UPDATE app_records SET data=data||'{\"state\":\"approved\"}' WHERE id=$1")
+    sqlx::query(set_state(storage, "approved"))
         .bind(Uuid::parse_str(&order).unwrap())
         .execute(&pool)
         .await
@@ -1063,7 +1080,7 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
     )
     .await;
     let shipped = shipped["order"]["id"].as_str().unwrap().to_owned();
-    sqlx::query("UPDATE app_records SET data=data||'{\"state\":\"shipped\"}' WHERE id=$1")
+    sqlx::query(set_state(storage, "shipped"))
         .bind(Uuid::parse_str(&shipped).unwrap())
         .execute(&pool)
         .await
@@ -1767,4 +1784,18 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
         .execute(&admin)
         .await
         .unwrap();
+}
+
+/// Put an order into a state behind the API's back, in either storage.
+fn set_state(storage: Storage, state: &str) -> &'static str {
+    match (storage, state) {
+        (Storage::Records, "approved") => {
+            "UPDATE app_records SET data=data||'{\"state\":\"approved\"}' WHERE id=$1"
+        }
+        (Storage::Records, _) => {
+            "UPDATE app_records SET data=data||'{\"state\":\"shipped\"}' WHERE id=$1"
+        }
+        (Storage::Tables, "approved") => "UPDATE orders SET state='approved' WHERE id=$1",
+        (Storage::Tables, _) => "UPDATE orders SET state='shipped' WHERE id=$1",
+    }
 }
