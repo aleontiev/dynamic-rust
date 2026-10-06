@@ -153,6 +153,11 @@ pub(super) async fn write(
                 .map_err(ApiError::internal)?;
             current
         }
+        ("providers", "update") => {
+            let id = id.ok_or(ApiError::NotFound)?;
+            super::integrations::update(connection, id, &input).await?;
+            fetch(connection, kind, id).await?
+        }
         ("users", "delete") => {
             // Removing a person ends their sessions and sign-in identities; the
             // records they made stay. Nobody removes themselves.
@@ -270,8 +275,12 @@ async fn role_data(
         .or_else(|| current.get("permissions"))
         .cloned()
         .unwrap_or_else(|| json!({}));
-    crate::parse_access_map(&permissions, &app.access_targets())
-        .map_err(|message| invalid("permissions", &message))?;
+    crate::parse_access_map_with_actions(
+        &permissions,
+        &app.access_targets(),
+        &app.registry.action_targets(),
+    )
+    .map_err(|message| invalid("permissions", &message))?;
     let mut record = json!({"name":name,"permissions":permissions});
     for key in ["managed", "description"] {
         if let Some(value) = current.get(key) {
@@ -313,7 +322,7 @@ fn page_data(app: &App, kind: &str, current: &Value, input: &Value) -> Result<Va
 }
 
 /// Every operation on every resource: what the managed Admin role grants.
-pub(crate) fn admin_access_map(app_models: impl Iterator<Item = String>) -> Value {
+pub(crate) fn admin_access_map(registry: &super::extensions::Registry) -> Value {
     let all = json!({"list":true,"read":true,"create":true,"update":true,"delete":true});
     let mut map = serde_json::Map::new();
     for kind in super::KINDS {
@@ -324,12 +333,19 @@ pub(crate) fn admin_access_map(app_models: impl Iterator<Item = String>) -> Valu
                 "users" => {
                     json!({"list":true,"read":true,"create":true,"update":true,"delete":true})
                 }
+                "providers" => json!({"list":true,"read":true,"update":true}),
                 _ => json!({"list":true,"read":true}),
             },
         );
     }
-    for model in app_models {
-        map.insert(model, all.clone());
+    for model in registry.models.keys() {
+        map.insert(model.clone(), all.clone());
+    }
+    // Every action on every record.
+    for (model, action) in registry.actions.keys() {
+        if let Some(rules) = map.get_mut(model).and_then(Value::as_object_mut) {
+            rules.insert(action.clone(), json!(true));
+        }
     }
     Value::Object(map)
 }
@@ -338,9 +354,9 @@ pub(crate) fn admin_access_map(app_models: impl Iterator<Item = String>) -> Valu
 /// with the registered models. The name is fixed; other roles are the owner's.
 pub async fn ensure_admin_role(
     connection: &mut PgConnection,
-    models: impl Iterator<Item = String>,
+    registry: &super::extensions::Registry,
 ) -> Result<Uuid, ApiError> {
-    let permissions = admin_access_map(models);
+    let permissions = admin_access_map(registry);
     let existing: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM app_records WHERE kind='roles' AND lower(data->>'name')='admin' ORDER BY created,id LIMIT 1",
     )
@@ -391,7 +407,7 @@ pub(crate) async fn admit_superuser(
     if !app.superusers.contains(&email.trim().to_ascii_lowercase()) {
         return Ok(());
     }
-    let admin = ensure_admin_role(connection, app.registry.models.keys().cloned()).await?;
+    let admin = ensure_admin_role(connection, &app.registry).await?;
     sqlx::query("UPDATE app_records SET data=jsonb_set(data,'{data,roles}',coalesce(data->'data'->'roles','[]'::jsonb)||to_jsonb($2::text)),updated=now() WHERE kind='users' AND id=$1 AND NOT coalesce(data->'data'->'roles','[]'::jsonb) ? $2::text")
         .bind(user)
         .bind(admin.to_string())

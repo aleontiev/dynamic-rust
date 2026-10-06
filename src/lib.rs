@@ -19,8 +19,9 @@ mod selection;
 mod sideload;
 
 pub use access::{
-    AccessMap, AccessRules, AccessTargets, CONDITION_OPERATORS, OPERATIONS as ACCESS_OPERATIONS,
-    condition_matches, grant_access, parse_access_map, parse_rule, split_lookup,
+    AccessMap, AccessRules, AccessTargets, ActionTargets, CONDITION_OPERATORS,
+    OPERATIONS as ACCESS_OPERATIONS, condition_matches, filter_matches, grant_access,
+    parse_access_map, parse_access_map_with_actions, parse_rule, split_lookup,
 };
 pub use error::{ApiError, ErrorBody, FieldErrors};
 pub use links::{LinkOptions, build_links};

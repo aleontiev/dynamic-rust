@@ -123,11 +123,28 @@ pub type AccessMap = BTreeMap<String, AccessRules>;
 /// storage cannot apply row filters).
 pub type AccessTargets = BTreeMap<String, Option<BTreeSet<String>>>;
 
+/// The custom actions an access map may grant, by resource: a rule for an
+/// action is `true` (on every record) or a condition the record must meet.
+pub type ActionTargets = BTreeMap<String, BTreeSet<String>>;
+
 /// Parse and validate an access map against the resources it may name.
 ///
 /// # Errors
 /// Returns a message naming the offending resource, operation or field.
 pub fn parse_access_map(value: &Value, targets: &AccessTargets) -> Result<AccessMap, String> {
+    parse_access_map_with_actions(value, targets, &ActionTargets::new())
+}
+
+/// Parse and validate an access map whose resources may also grant the custom
+/// actions `actions` names for them.
+///
+/// # Errors
+/// Returns a message naming the offending resource, operation or field.
+pub fn parse_access_map_with_actions(
+    value: &Value,
+    targets: &AccessTargets,
+    actions: &ActionTargets,
+) -> Result<AccessMap, String> {
     let Some(resources) = value.as_object() else {
         return Err("Permissions must be an object keyed by resource.".into());
     };
@@ -143,7 +160,11 @@ pub fn parse_access_map(value: &Value, targets: &AccessTargets) -> Result<Access
         };
         let mut parsed = AccessRules::new();
         for (operation, rule) in rules {
-            if !OPERATIONS.contains(&operation.as_str()) {
+            if !OPERATIONS.contains(&operation.as_str())
+                && !actions
+                    .get(resource)
+                    .is_some_and(|names| names.contains(operation))
+            {
                 return Err(format!("{resource}: unknown operation {operation}"));
             }
             let filter = parse_rule(rule, fields.as_ref())
@@ -157,6 +178,35 @@ pub fn parse_access_map(value: &Value, targets: &AccessTargets) -> Result<Access
         }
     }
     Ok(map)
+}
+
+/// Whether a record meets a rule, with `actor_id` standing in for `$user.id`.
+#[must_use]
+pub fn filter_matches(filter: &PermissionFilter, record: &Value, actor_id: &str) -> bool {
+    match filter {
+        PermissionFilter::All => true,
+        PermissionFilter::None => false,
+        PermissionFilter::Group {
+            connector,
+            negated,
+            children,
+        } => {
+            let result = if connector.eq_ignore_ascii_case("or") {
+                children
+                    .iter()
+                    .any(|child| filter_matches(child, record, actor_id))
+            } else {
+                !children.is_empty()
+                    && children
+                        .iter()
+                        .all(|child| filter_matches(child, record, actor_id))
+            };
+            result != *negated
+        }
+        PermissionFilter::Condition { lookup, value } => {
+            condition_matches(record, lookup, value, actor_id)
+        }
+    }
 }
 
 /// Parse one rule. `Ok(None)` is a rule that grants nothing.

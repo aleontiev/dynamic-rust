@@ -6,6 +6,7 @@ use super::{
 use crate::{ApiDocument, ApiError, PageMeta, QueryFeatures};
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
@@ -257,7 +258,7 @@ async fn write(
     let input = unwrap(&app, &kind, input)?;
     let mut tx = app.pool.begin().await.map_err(ApiError::internal)?;
     lock(&mut tx).await?;
-    let mut context = Context::new(&mut tx, &app.registry, actor);
+    let mut context = Context::new(&mut tx, &app.registry, actor).with_pool(app.pool.clone());
     let row = match operation {
         "create" => context.create(&kind, input).await?,
         "update" => context.update(&kind, id.unwrap(), input).await?,
@@ -320,23 +321,48 @@ pub(super) async fn action(
     State(app): State<App>,
     headers: HeaderMap,
     Path((kind, id, name)): Path<(String, Uuid, String)>,
-    Json(input): Json<Value>,
+    body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    // An action without parameters may be posted with no body at all.
+    let input: Value = if body.iter().all(u8::is_ascii_whitespace) {
+        json!({})
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|_| ApiError::Parse("Expected a JSON body.".into()))?
+    };
+    if kind == "providers" {
+        return super::integrations::action(&app, &headers, id, &name, &input)
+            .await
+            .map(Json);
+    }
     let actor = app.actor(&user(&app, &headers).await?).await?;
     let action = app
         .registry
         .actions
-        .get(&(kind.clone(), name))
+        .get(&(kind.clone(), name.clone()))
         .ok_or(ApiError::NotFound)?
         .clone();
-    if !actor.may_run(&action) {
+    if !actor.may_run_action(&kind, &name, &action) {
         return Err(ApiError::Forbidden);
+    }
+    let missing = action.details.missing(&input);
+    if !missing.is_empty() {
+        return Err(ApiError::Validation(missing));
     }
     let mut tx = app.pool.begin().await.map_err(ApiError::internal)?;
     lock(&mut tx).await?;
-    let mut context = Context::new(&mut tx, &app.registry, actor);
+    let mut context = Context::new(&mut tx, &app.registry, actor).with_pool(app.pool.clone());
     // Access to the targeted record is required even if the action uses raw SQL.
-    context.get(&kind, id).await?;
+    let record = context.get(&kind, id).await?;
+    // A role's rule for the action may hold for some records only.
+    if !context.actor.may_run_on(&kind, &name, &action, &record) {
+        return Err(ApiError::Forbidden);
+    }
+    if !action.details.applies_to(&record) {
+        return Err(ApiError::Conflict(
+            "This action does not apply to the record in its current state.".into(),
+        ));
+    }
     let result = action
         .handler
         .run(&mut context, json!({"id":id,"data":input}))

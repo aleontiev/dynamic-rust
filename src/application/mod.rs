@@ -16,7 +16,11 @@ use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
 mod extension_api;
 pub mod extensions;
+pub mod integrations;
 pub mod task_runner;
+/// The HTTP client library behind [`extensions::Context::http`] and
+/// integrations, for building requests and reading responses.
+pub use reqwest;
 
 mod core;
 pub mod google_auth;
@@ -80,9 +84,11 @@ impl App {
         .await
         .map_err(ApiError::internal)?;
         let targets = self.access_targets();
+        let actions = self.registry.action_targets();
         for (name, permissions) in roles {
             // Maps are validated when saved; anything unreadable grants nothing.
-            let access = crate::parse_access_map(&permissions, &targets).unwrap_or_default();
+            let access = crate::parse_access_map_with_actions(&permissions, &targets, &actions)
+                .unwrap_or_default();
             actor.hold(&name, access);
         }
         actor.admit();
@@ -214,8 +220,17 @@ fn fields(kind: &str) -> Vec<(&str, &str)> {
         "roles" => vec![("name", "string"), ("permissions", "permissions")],
         "providers" => vec![
             ("name", "string"),
+            ("label", "string"),
+            ("description", "string"),
             ("kind", "string"),
             ("enabled", "boolean"),
+            ("status", "string"),
+            ("account", "json"),
+            ("connected_at", "datetime"),
+            ("error", "string"),
+            ("client_id", "string"),
+            ("client_secret", "string"),
+            ("redirect_uri", "string"),
         ],
         "views" => vec![("name", "string"), ("resource", "string"), ("data", "json")],
         _ => vec![("name", "string"), ("data", "json")],
@@ -243,6 +258,9 @@ fn writable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
         ("dashboards", "name" | "data") | ("views", "name" | "resource" | "data") => {
             actor.granted(kind, "update")
         }
+        ("providers", "enabled" | "client_id" | "client_secret") => {
+            actor.granted("providers", "update")
+        }
         _ => false,
     }
 }
@@ -265,7 +283,7 @@ pub(crate) fn core_supports(kind: &str, operation: &str) -> bool {
         (
             "roles" | "dashboards" | "views" | "users",
             "create" | "update" | "delete"
-        )
+        ) | ("providers", "update")
     )
 }
 /// The roles that exist, as choices for a user's `roles` field.
@@ -307,6 +325,21 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
                 field["description"]=json!("What this role may do, per resource and operation. A rule is allowed, denied, or a condition the records must meet.");
                 field["resources"]=access_resources(app);
             }
+            ("providers",_)=>{
+                let description=match name {
+                    "status"=>"needs_credentials until the client ID and secret are saved, then disconnected, connected, or error when access was refused or lost.",
+                    "account"=>"The account this app is connected to, as the service identified it.",
+                    "error"=>"Why the last attempt to connect or refresh access failed.",
+                    "client_id"=>"The OAuth client ID from the service's developer console.",
+                    "client_secret"=>"The OAuth client secret. It is kept privately and never shown again; enter a new one to replace it.",
+                    "redirect_uri"=>"Register this exact URL as a redirect URI in the service's developer console.",
+                    "enabled"=>"Turn off to stop the app from using this service without disconnecting it.",
+                    _=>"",
+                };
+                if !description.is_empty() { field["description"]=json!(description); }
+                if name=="client_secret" { field["secret"]=json!(true); }
+                if name=="client_id" || name=="client_secret" { field["required"]=json!(false); field["nullable"]=json!(true); field["null"]=json!(true); }
+            }
             _=>{}
         }
         (name.into(),field)
@@ -334,10 +367,24 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
             )
         })
         .collect();
-    json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":crate::python_title(&kind.replace('_'," ")),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":section(kind),"fields":fields,"permissions":{"list":readable,"read":readable,"create":operations["create"],"update":operations["update"],"delete":operations["delete"],"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]})
+    let mut value = json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":crate::python_title(&kind.replace('_'," ")),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":section(kind),"fields":fields,"permissions":{"list":readable,"read":readable,"create":operations["create"],"update":operations["update"],"delete":operations["delete"],"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]});
+    if kind == "providers" {
+        value["name_field"] = json!("label");
+        value["list_fields"] = json!(["label", "status", "connected_at"]);
+        value["actions"] = if actor.granted("providers", "update") {
+            integrations::actions()
+        } else {
+            json!([])
+        };
+    }
+    value
 }
 /// Built-in fields the list endpoint can filter and sort by.
 fn filterable(kind: &str, field: &str) -> bool {
+    // A provider's secret and redirect URI are not stored on the record.
+    if kind == "providers" && ["client_secret", "redirect_uri"].contains(&field) {
+        return false;
+    }
     !fields(kind).iter().any(|(name, typ)| {
         *name == field && ["json", "list", "permissions", "image upload"].contains(typ)
     })
@@ -355,9 +402,12 @@ fn access_resources(app: &App) -> Value {
             )
         })
         .collect();
+    let actions = app.registry.action_targets();
     for (name, model) in &app.registry.models {
-        // Resources without grants are open to everyone; a rule adds nothing.
-        if model.resource.role_grants.is_empty() {
+        // Resources without grants are open to everyone; a rule adds nothing,
+        // except for their actions, which roles may still be granted.
+        let open = model.resource.role_grants.is_empty();
+        if open && !actions.contains_key(name) {
             continue;
         }
         let label = model
@@ -369,7 +419,17 @@ fn access_resources(app: &App) -> Value {
                 || crate::python_title(&name.replace('_', " ")),
                 str::to_owned,
             );
-        resources.insert(name.clone(), json!({"label":label,"conditional":true}));
+        let mut entry = json!({"label":label,"conditional":true,"open":open});
+        if let Some(names) = actions.get(name) {
+            entry["actions"] = json!(names
+                .iter()
+                .map(|action| {
+                    let details = &app.registry.actions[&(name.clone(), action.clone())].details;
+                    json!({"name":action,"label":details.label.clone().unwrap_or_else(|| crate::python_title(&action.replace('_', " ")))})
+                })
+                .collect::<Vec<_>>());
+        }
+        resources.insert(name.clone(), entry);
     }
     Value::Object(resources)
 }
@@ -547,7 +607,18 @@ async fn list(
         .fetch_all(&app.pool)
         .await
         .map_err(ApiError::internal)?;
+    let saved = if kind == "providers" {
+        integrations::secrets_saved(&app.pool).await?
+    } else {
+        vec![]
+    };
     for record in &mut records {
+        if kind == "providers" {
+            let secret = saved
+                .iter()
+                .any(|name| record["name"].as_str() == Some(name));
+            integrations::present(&app, record, secret);
+        }
         *record = project_record(&kind, record.take(), &features);
     }
     Ok(Json(ApiDocument::many(
@@ -578,7 +649,7 @@ async fn retrieve(
     if !own && !app.actor(&person).await?.core_readable(&kind) {
         return Err(ApiError::Forbidden);
     }
-    let record = sqlx::query_scalar(&format!(
+    let mut record: Value = sqlx::query_scalar(&format!(
         "SELECT {DOCUMENT} FROM app_records WHERE kind=$1 AND id=$2"
     ))
     .bind(&kind)
@@ -587,6 +658,13 @@ async fn retrieve(
     .await
     .map_err(ApiError::internal)?
     .ok_or(ApiError::NotFound)?;
+    if kind == "providers" {
+        let saved = integrations::secrets_saved(&app.pool).await?;
+        let secret = saved
+            .iter()
+            .any(|name| record["name"].as_str() == Some(name));
+        integrations::present(&app, &mut record, secret);
+    }
     let features = QueryFeatures::parse(raw.as_deref().unwrap_or(""), 10000)?;
     Ok(Json(ApiDocument::one(
         singular(&kind),
@@ -683,8 +761,15 @@ async fn core_write(
     let actor = app.actor(&user(app, headers).await?).await?;
     let mut tx = app.pool.begin().await.map_err(ApiError::internal)?;
     extensions::lock(&mut tx).await?;
-    let record = core::write(app, &mut tx, &actor, kind, id, input, method).await?;
+    let mut record = core::write(app, &mut tx, &actor, kind, id, input, method).await?;
     tx.commit().await.map_err(ApiError::internal)?;
+    if kind == "providers" {
+        let saved = integrations::secrets_saved(&app.pool).await?;
+        let secret = saved
+            .iter()
+            .any(|name| record["name"].as_str() == Some(name));
+        integrations::present(app, &mut record, secret);
+    }
     Ok(record)
 }
 /// Built-in resources answer 405 before any body is read, so an unsupported
@@ -756,6 +841,7 @@ pub fn router(app: App) -> Router {
         .route("/operator/session",axum::routing::post(operator::session))
         .route("/auth/google",get(google_auth::start))
         .route("/auth/google/callback",get(google_auth::callback))
+        .route("/integrations/{name}/callback",get(integrations::callback))
         .route("/admin/",get(metadata).options(metadata)).route("/admin/users/me/",get(me))
         .route("/admin/{kind}/",get(list).options(options).post(create))
         .route("/admin/{kind}/{id}/",get(retrieve).patch(update).put(replace).delete(delete))

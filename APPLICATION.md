@@ -85,8 +85,9 @@ Superusers, and holders of a role whose map grants those operations on `roles`
 and `users`, create, edit and delete roles, add and remove users (removing
 one ends their sessions and sign-in identities; nobody removes themselves), and
 set the `roles` (and `name`) of users; deleting a role removes it from every user. `dashboards` and `views`
-(the admin's saved pages) are written the same way. Everything else built in
-remains read-only. Role names must be unique; `*` and `authenticated` are
+(the admin's saved pages) are written the same way, and `providers` take
+updates to their credentials (see [Calling outside services](#calling-outside-services)).
+Everything else built in remains read-only. Role names must be unique; `*` and `authenticated` are
 reserved. Role entries on a user that are not record ids are still treated as
 role names, so applications that assigned roles by name keep working.
 
@@ -161,10 +162,74 @@ Implement `Handler::run(&self, &mut Context<'_>, Value) -> Result<Value, ApiErro
 for a custom API action. Register with
 `registry.action("orders", "approve", &["buyer"], Approve)?`. It is POSTed to
 `/api/admin/orders/UUID/actions/approve/` and receives
-`{"id":"UUID","data":{...request JSON...}}`. The runtime checks action roles and
-record visibility before invoking it. Context mutations continue to enforce model
-permissions. `context.connection` is the current app-scoped SQL connection for
-advanced transactional operations; code using raw SQL must enforce its own rules.
+`{"id":"UUID","data":{...request JSON...}}` (an empty body is `{}`). The
+runtime checks action roles and record visibility before invoking it. Context
+mutations continue to enforce model permissions. `context.connection` is the
+current app-scoped SQL connection for advanced transactional operations; code
+using raw SQL must enforce its own rules.
+
+The admin shows each action a person may run as a button on the record page.
+`registry.describe_action` says how, after the action is registered:
+
+```rust
+registry.action("orders", "reject", &["approver"], Reject)?;
+registry.describe_action("orders", "reject", json!({
+    "label": "Reject", "icon": "close-circle-outline",
+    "description": "Send the order back to its requester.",
+    "confirm": "Reject this order?",
+    "when": {"state__in": ["submitted"]},
+    "parameters": {"reason": {"type": "string", "required": true, "label": "Reason"}}
+}))?;
+```
+
+`when` holds lookups on the record's own fields — `field` (equals),
+`field__in` (a list) and `field__isnull` (a boolean). The admin shows the button
+only on matching records, and the runtime answers 409 for any other record, so a
+handler need not re-check them. `parameters` makes the admin ask for input in a
+dialog before running the action; the values arrive in `data`. A parameter's
+`type` is a field kind (`string`, `integer`, `decimal`, `money`, `boolean`,
+`date`, `datetime`, `email`, ...), with optional `label`, `description`,
+`required` (enforced: missing or blank answers 400) and `choices` (values, or
+`{"id", "label"}` objects). `confirm` asks before running an action without
+parameters. A handler's JSON result is returned to the caller; return the
+updated record (`ctx.get(...)`) so the admin shows its new state.
+
+Who may run an action comes from two places, with union semantics:
+
+- **Code**: `&["approver"]` lets anyone holding a role named exactly `approver`
+  — a stored role of that name included — run it on any record they can read.
+  Superusers run every action.
+- **Stored roles**: a role's access map may name the actions registered on a
+  resource next to its operations, as `true` (every record) or a condition the
+  record must meet: `{"purchase_orders": {"list": true, "read": true,
+  "approve": {"approver": "$user.id"}}}` lets its holders approve the orders
+  assigned to them and no others. Unknown action names are refused when the
+  role is saved. The managed Admin role holds every action. The role editor
+  lists each resource's actions under it (`OPTIONS /api/admin/roles/` reports
+  them as `actions` on each resource under the `permissions` field), and a
+  person sees an action's button only when one of these grants it.
+
+Prefer stored-role grants for anything an administrator should be able to
+change without a release.
+
+Running an action is the permission it checks; the handler's writes are then
+checked against the person's own grants. Workflow code that must change what
+the person may not edit directly — an approver approving an order they may
+only read, or a `state` field that is read-only for everyone — writes through
+`ctx.elevated()`, the same transaction with the application's own authority:
+it skips the actor's grants, row filters and read-only fields, but still runs
+hooks, validation, references and uniqueness, and keeps `ctx.actor.id`:
+
+```rust
+ctx.elevated()
+    .update("purchase_orders", id, json!({"state": "approved", "approved_by": ctx.actor.id}))
+    .await?;
+```
+
+Use it only after the code has decided the change is allowed. Making workflow
+fields such as `state`, totals and numbers `.readonly(...)` keeps people from
+setting them through the record form or a PATCH, so the actions are the only
+way to move a record through its states.
 
 ## Tasks
 
@@ -174,12 +239,80 @@ the same transaction as the triggering write. Repeating a key with different
 input/actor is rejected. The task receives `task_id`, `idempotency_key` and `data`.
 The actor's roles are loaded again at execution time.
 
-Call `application::task_runner::tick(&app).await?` from an IAM-only scheduled Lambda
-or a native loop. One tick processes at most one job. Claims expire after 120s;
-handlers time out after 60s, retry with exponential backoff, and stop after five
-attempts. Database effects and completion commit together. External effects are
-at-least-once: pass the same idempotency key to the external provider. This queue
-is for app business tasks, not a platform's project/agent messages.
+Call `application::task_runner::drain(&app, budget).await?` from an IAM-only
+scheduled Lambda (it runs due tasks one after another until none is due or the
+budget has passed), or `tick(&app)` — one task — from a native loop. Claims
+expire after 120s; handlers time out after 60s, retry with exponential backoff,
+and stop after five attempts. Database effects and completion commit together.
+External effects are at-least-once: pass the same idempotency key to the
+external provider. This queue is for app business tasks, not a platform's
+project/agent messages.
+
+A task does not hold the application write lock until its first write through
+the context, so calls to outside services made before it do not hold up the
+app's users. Call `context.lock().await?` first when a later write depends on
+what the task read, or before writing with raw SQL. Keep outside calls out of
+hooks and actions — they run inside a user's request, which must finish within
+the host's timeout — and queue a task for them instead.
+
+## Calling outside services
+
+`dynamic_rust::application::reqwest` is the HTTP client library, and
+`context.http()` a shared client with 10 s connect and 25 s request timeouts —
+no dependency to add. Use it from tasks.
+
+Services that sign in with OAuth 2 (QuickBooks Online, Xero, Google, Slack, ...)
+are registered as **integrations**:
+
+```rust
+use dynamic_rust::application::extensions::Integration;
+
+registry.integration(
+    Integration::oauth2("quickbooks", "QuickBooks Online")
+        .describe("Two-way sync of vendors, accounts, purchase orders and bills.")
+        .authorize_url("https://appcenter.intuit.com/connect/oauth2")
+        .token_url("https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer")
+        .scopes(&["com.intuit.quickbooks.accounting"])
+        .account_params(&["realmId"]),
+)?;
+```
+
+Each registered integration is a record in the built-in `providers` resource
+(`registry.migrate` adds it). An administrator — a superuser, or anyone whose
+role grants `providers` `update` — opens it, enters the **client ID** and
+**client secret** from the service's developer console, registers the record's
+**redirect URI** (`https://<app>/api/integrations/<name>/callback`) there, and
+presses **Connect**. After the service's consent page the record shows
+`status` `connected`, when, and the `account` the service identified (the
+callback parameters named in `account_params`, e.g. QuickBooks' `realmId`).
+**Disconnect** drops the tokens. Changing the client ID or secret clears the
+connection. Roles that grant only `providers` `list`/`read` see the status but
+neither the buttons nor the credentials; nobody sees the secret or the tokens,
+which live in a table no API returns. `.authorize_param(k, v)` adds query
+parameters to the consent page (Google's `access_type=offline`), and
+`.client_secret_in_body()` sends the credentials as form fields for services
+that refuse HTTP Basic.
+
+Code uses the connection from a task:
+
+```rust
+let books = context.integration("quickbooks").await?;
+let realm = books.account["realmId"].as_str().unwrap_or_default();
+let vendor: Value = books
+    .get(&format!("https://quickbooks.api.intuit.com/v3/company/{realm}/vendor/58"))
+    .header("accept", "application/json")
+    .send().await.map_err(ApiError::internal)?
+    .json().await.map_err(ApiError::internal)?;
+```
+
+`integration` refreshes the access token first when it expires within a minute
+and keeps a rotated refresh token, committing that on its own so it survives
+the task failing afterwards. When the service is not connected, is turned off
+(`enabled` false), or refuses to refresh, it answers 409 with a message for
+people, and the provider record's `status` becomes `error` with the reason, so
+an administrator knows to connect it again. The connection belongs to the app,
+not to the person whose action queued the task: decide in code who may start
+work that uses it.
 
 ## Host
 

@@ -2,6 +2,7 @@
 //! Registered, transaction-backed application extensions. All writes, hooks,
 //! actions and task effects share a transaction. No cloud credentials are needed.
 use super::DOCUMENT;
+pub use super::integrations::{Connection, Integration};
 use crate::{
     AccessMap, AccessTargets, ApiError, Field, FieldKind, PermissionFilter, Principal,
     QueryFeatures, RelationLink, Resource,
@@ -111,9 +112,32 @@ impl Actor {
             is_superuser: self.is_superuser,
         }
     }
+    /// Whether the code lets this person run an action: a superuser, or a
+    /// holder of one of the role names the action was registered with.
     #[must_use]
     pub fn may_run(&self, action: &Action) -> bool {
         self.is_superuser || action.roles.contains("*") || !action.roles.is_disjoint(&self.roles)
+    }
+    /// Whether this person may run an action on some records: the code lets
+    /// them, or a held role's access map grants it (on every record, or on
+    /// those meeting a condition).
+    #[must_use]
+    pub fn may_run_action(&self, kind: &str, name: &str, action: &Action) -> bool {
+        self.may_run(action)
+            || self
+                .access
+                .values()
+                .any(|map| map.get(kind).is_some_and(|rules| rules.contains_key(name)))
+    }
+    /// Whether this person may run an action on this record.
+    #[must_use]
+    pub fn may_run_on(&self, kind: &str, name: &str, action: &Action, record: &Value) -> bool {
+        self.may_run(action)
+            || self.access.values().any(|map| {
+                map.get(kind)
+                    .and_then(|rules| rules.get(name))
+                    .is_some_and(|rule| crate::filter_matches(rule, record, &self.id))
+            })
     }
 }
 
@@ -327,6 +351,23 @@ impl Model {
 pub struct Action {
     pub roles: BTreeSet<String>,
     pub handler: Arc<dyn Handler>,
+    /// How the admin presents the action, set by [`Registry::describe_action`]:
+    /// its label, icon, confirmation, parameters and the records it applies to.
+    pub details: ActionDetails,
+}
+/// Presentation and preconditions of a record action.
+#[derive(Clone, Debug, Default)]
+pub struct ActionDetails {
+    pub label: Option<String>,
+    pub icon: Option<String>,
+    pub description: Option<String>,
+    pub confirm: Option<String>,
+    /// Lookups the record must satisfy (`field`, `field__in`, `field__isnull`).
+    /// The admin shows the action only on matching records and the runtime
+    /// refuses it elsewhere.
+    pub when: Map<String, Value>,
+    /// Inputs the admin asks for before running the action, by name.
+    pub parameters: Map<String, Value>,
 }
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -334,6 +375,8 @@ pub struct Registry {
     pub actions: BTreeMap<(String, String), Action>,
     pub tasks: BTreeMap<String, Arc<dyn Handler>>,
     pub migrations: BTreeMap<String, String>,
+    /// Outside services the app connects to, by name; each is a `providers` record.
+    pub integrations: BTreeMap<String, Integration>,
 }
 impl Registry {
     /// A model's resource with the actor's stored roles merged into its grants.
@@ -343,10 +386,28 @@ impl Registry {
         let mut resource = model.resource.clone();
         for (role, access) in &actor.access {
             if let Some(rules) = access.get(kind) {
-                crate::grant_access(&mut resource, role, rules);
+                // Action rules are checked when an action runs, not here.
+                let operations: crate::AccessRules = rules
+                    .iter()
+                    .filter(|(operation, _)| crate::ACCESS_OPERATIONS.contains(&operation.as_str()))
+                    .map(|(operation, rule)| (operation.clone(), rule.clone()))
+                    .collect();
+                crate::grant_access(&mut resource, role, &operations);
             }
         }
         Some(resource)
+    }
+    /// The actions an access map may grant: every registered action, by model.
+    #[must_use]
+    pub fn action_targets(&self) -> crate::ActionTargets {
+        let mut targets = crate::ActionTargets::new();
+        for (kind, name) in self.actions.keys() {
+            targets
+                .entry(kind.clone())
+                .or_default()
+                .insert(name.clone());
+        }
+        targets
     }
     /// What an access map may name: every registered model with its fields.
     /// The application adds its built-in resources, which take only booleans.
@@ -424,8 +485,107 @@ impl Registry {
             Action {
                 roles: roles.iter().map(|s| (*s).into()).collect(),
                 handler: Arc::new(handler),
+                details: ActionDetails::default(),
             },
         );
+        Ok(())
+    }
+    /// Describe how a registered action appears in the admin and which records
+    /// it applies to:
+    ///
+    /// ```json
+    /// {"label": "Reject", "icon": "close-circle-outline",
+    ///  "description": "Send the order back to its requester.",
+    ///  "confirm": "Reject this order?",
+    ///  "when": {"state__in": ["submitted"]},
+    ///  "parameters": {"reason": {"type": "string", "required": true,
+    ///                            "label": "Reason", "description": "Shown to the requester."}}}
+    /// ```
+    ///
+    /// `when` holds lookups on the record's own fields: `field` (equals),
+    /// `field__in` (a list) and `field__isnull` (a boolean). The admin hides the
+    /// action on other records and the runtime answers 409 there. Parameter
+    /// types are field kinds (`string`, `integer`, `decimal`, `date`, ...), with
+    /// optional `choices` (values, or `{"id", "label"}` objects); a required
+    /// parameter must be present and non-empty when the action runs.
+    ///
+    /// # Errors
+    /// Rejects unknown actions, unknown keys, lookups on unregistered fields and
+    /// malformed parameters.
+    pub fn describe_action(
+        &mut self,
+        model: &str,
+        name: &str,
+        details: Value,
+    ) -> Result<(), ApiError> {
+        let invalid = |message: &str| ApiError::Parse(format!("Action {model}.{name}: {message}"));
+        let resource = self
+            .models
+            .get(model)
+            .map(|m| m.resource.clone())
+            .ok_or_else(|| invalid("unknown model"))?;
+        let action = self
+            .actions
+            .get_mut(&(model.into(), name.into()))
+            .ok_or_else(|| invalid("register the action before describing it"))?;
+        let Value::Object(details) = details else {
+            return Err(invalid("details must be an object"));
+        };
+        let mut parsed = ActionDetails::default();
+        for (key, value) in details {
+            let text = || {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid(&format!("{key} must be text")))
+            };
+            match key.as_str() {
+                "label" => parsed.label = Some(text()?),
+                "icon" => parsed.icon = Some(text()?),
+                "description" => parsed.description = Some(text()?),
+                "confirm" => parsed.confirm = Some(text()?),
+                "when" => {
+                    let Value::Object(lookups) = value else {
+                        return Err(invalid("when must be an object of lookups"));
+                    };
+                    for (lookup, expected) in &lookups {
+                        let (field, operator) =
+                            lookup.split_once("__").unwrap_or((lookup, "exact"));
+                        if field != "id" && resource.field(field).is_none() {
+                            return Err(invalid(&format!(
+                                "when names an unregistered field: {field}"
+                            )));
+                        }
+                        let valid = match operator {
+                            "exact" => !expected.is_array() && !expected.is_object(),
+                            "in" => expected.is_array(),
+                            "isnull" => expected.is_boolean(),
+                            _ => false,
+                        };
+                        if !valid {
+                            return Err(invalid(&format!("unsupported when lookup: {lookup}")));
+                        }
+                    }
+                    parsed.when = lookups;
+                }
+                "parameters" => {
+                    let Value::Object(parameters) = value else {
+                        return Err(invalid("parameters must be an object"));
+                    };
+                    for (parameter, spec) in parameters {
+                        if !identifier(&parameter) {
+                            return Err(invalid(&format!("invalid parameter name: {parameter}")));
+                        }
+                        parsed.parameters.insert(
+                            parameter.clone(),
+                            parameter_metadata(&parameter, &spec).map_err(|m| invalid(&m))?,
+                        );
+                    }
+                }
+                _ => return Err(invalid(&format!("unknown detail: {key}"))),
+            }
+        }
+        action.details = parsed;
         Ok(())
     }
     /// Register a durable handler. Rejects invalid or duplicate task names.
@@ -437,6 +597,24 @@ impl Registry {
             return Err(ApiError::Parse("Invalid or duplicate task".into()));
         }
         self.tasks.insert(name.into(), Arc::new(handler));
+        Ok(())
+    }
+    /// Register an OAuth 2 service the app connects to. It appears as a
+    /// `providers` record that administrators configure and connect; code
+    /// reaches it through [`Context::integration`].
+    ///
+    /// # Errors
+    /// Rejects invalid or duplicate names and non-HTTPS endpoints.
+    pub fn integration(&mut self, integration: Integration) -> Result<(), ApiError> {
+        integration.validate()?;
+        if self.integrations.contains_key(&integration.name) {
+            return Err(ApiError::Parse(format!(
+                "Duplicate integration: {}",
+                integration.name
+            )));
+        }
+        self.integrations
+            .insert(integration.name.clone(), integration);
         Ok(())
     }
     /// Register an ordered, append-only SQL migration. Rejects invalid or duplicate migration names.
@@ -465,7 +643,8 @@ impl Registry {
             .execute(&mut *tx)
             .await
             .map_err(ApiError::internal)?;
-        super::core::ensure_admin_role(&mut tx, self.models.keys().cloned()).await?;
+        super::core::ensure_admin_role(&mut tx, self).await?;
+        super::integrations::sync_providers(&mut tx, &self.integrations).await?;
         for (name, sql) in &self.migrations {
             let digest = super::hash(sql);
             let prior: Option<String> =
@@ -496,7 +675,7 @@ impl Registry {
         tx.commit().await.map_err(ApiError::internal)
     }
 }
-fn identifier(value: &str) -> bool {
+pub(super) fn identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
         && value
@@ -520,15 +699,100 @@ pub struct Context<'a> {
     pub registry: &'a Registry,
     pub actor: Actor,
     depth: usize,
+    /// Whether this transaction holds the application write lock.
+    locked: bool,
+    /// For work that must commit on its own, such as refreshing an
+    /// integration's tokens.
+    pool: Option<PgPool>,
+    /// Writes with the application's own authority ([`Context::elevated`]).
+    elevated: bool,
 }
 impl<'a> Context<'a> {
+    /// A context over a transaction that already holds the application write
+    /// lock ([`lock`]).
     pub fn new(connection: &'a mut PgConnection, registry: &'a Registry, actor: Actor) -> Self {
         Self {
             connection,
             registry,
             actor,
             depth: 0,
+            locked: true,
+            pool: None,
+            elevated: false,
         }
+    }
+    /// This transaction with the application's own authority, for workflow
+    /// code that changes records the person may not edit directly — a role
+    /// allowed to run *approve* on an order need not be allowed to *update*
+    /// it, and an order's `state` can be read-only for everyone. Reads and
+    /// writes through it skip the actor's grants, row filters and read-only
+    /// fields, but still run hooks, validation, references and uniqueness.
+    /// `actor.id` stays the person's, so records can still say who did it.
+    ///
+    /// ```ignore
+    /// ctx.elevated().update("orders", id, json!({"state": "approved"})).await?;
+    /// ```
+    pub fn elevated(&mut self) -> Context<'_> {
+        let mut actor = self.actor.clone();
+        actor.is_superuser = true;
+        Context {
+            connection: &mut *self.connection,
+            registry: self.registry,
+            actor,
+            depth: self.depth,
+            // Taking the lock again within the transaction is harmless.
+            locked: self.locked,
+            pool: self.pool.clone(),
+            elevated: true,
+        }
+    }
+    /// A context whose transaction takes the write lock at its first write, so
+    /// reads and outside calls before it do not hold up other writers.
+    pub(super) fn deferred(
+        connection: &'a mut PgConnection,
+        registry: &'a Registry,
+        actor: Actor,
+        pool: PgPool,
+    ) -> Self {
+        Self {
+            locked: false,
+            pool: Some(pool),
+            ..Self::new(connection, registry, actor)
+        }
+    }
+    pub(super) fn with_pool(mut self, pool: PgPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+    /// Take the application write lock now, if this transaction does not hold
+    /// it yet. Writes through the context take it themselves; call this before
+    /// a read whose result a later write depends on, or before raw SQL writes.
+    ///
+    /// # Errors
+    /// Returns database errors.
+    pub async fn lock(&mut self) -> Result<(), ApiError> {
+        if !self.locked {
+            lock(&mut *self.connection).await?;
+            self.locked = true;
+        }
+        Ok(())
+    }
+    /// The connection to a registered integration, with a current access
+    /// token (refreshed if it was about to expire). Use it for calls to the
+    /// service: `context.integration("quickbooks").await?.get(url).send().await`.
+    ///
+    /// # Errors
+    /// Answers 409 when the service is not connected, is turned off, or its
+    /// tokens can no longer be refreshed (the provider record then shows why).
+    pub async fn integration(&mut self, name: &str) -> Result<Connection, ApiError> {
+        let pool = self.pool.clone();
+        super::integrations::connect(self, pool.as_ref(), name).await
+    }
+    /// The shared outbound HTTP client (10 s connect and 25 s request
+    /// timeouts) for services that need no integration.
+    #[must_use]
+    pub fn http(&self) -> &'static reqwest::Client {
+        super::integrations::http()
     }
     fn effective(&self, kind: &str, operation: &str) -> Result<Resource, ApiError> {
         let resource = self
@@ -647,6 +911,7 @@ impl<'a> Context<'a> {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, ApiError>> + Send + 'b>>
     {
         Box::pin(async move {
+            self.lock().await?;
             if self.depth >= 16 {
                 return Err(ApiError::Parse("Recursive hook limit exceeded".into()));
             }
@@ -680,7 +945,18 @@ impl<'a> Context<'a> {
                 } else {
                     "PATCH"
                 };
-                let patch = resource.validate_input_for(input, method)?;
+                let patch = if self.elevated {
+                    // Workflow code may set fields people cannot.
+                    let mut writable = resource.clone();
+                    for field in &mut writable.fields {
+                        field.read_only = false;
+                        field.only_update = false;
+                        field.immutable = false;
+                    }
+                    writable.validate_input_for(input, method)?
+                } else {
+                    resource.validate_input_for(input, method)?
+                };
                 record.as_object_mut().unwrap().extend(patch);
             }
             let savepoint = format!("dynamic_write_{}", self.depth);
@@ -1104,34 +1380,11 @@ fn scope_value(value: &Value, resource: &Resource) -> String {
     }
 }
 fn check_proposed_scope(resource: &Resource, record: &Value) -> Result<(), ApiError> {
-    fn matches(resource: &Resource, record: &Value, filter: &PermissionFilter) -> bool {
-        match filter {
-            PermissionFilter::All => true,
-            PermissionFilter::None => false,
-            PermissionFilter::Group {
-                connector,
-                negated,
-                children,
-            } => {
-                let result = if connector.eq_ignore_ascii_case("or") {
-                    children.iter().any(|c| matches(resource, record, c))
-                } else {
-                    !children.is_empty() && children.iter().all(|c| matches(resource, record, c))
-                };
-                result != *negated
-            }
-            PermissionFilter::Condition { lookup, value } => crate::condition_matches(
-                record,
-                lookup,
-                value,
-                resource.row_actor_id.as_deref().unwrap_or_default(),
-            ),
-        }
-    }
+    let actor = resource.row_actor_id.as_deref().unwrap_or_default();
     if resource
         .effective_row_filter
         .as_ref()
-        .is_some_and(|f| !matches(resource, record, f))
+        .is_some_and(|f| !crate::filter_matches(f, record, actor))
     {
         Err(ApiError::Forbidden)
     } else {
@@ -1165,6 +1418,148 @@ pub fn metadata(model: &Model, actor: &Actor, registry: &Registry) -> Value {
     }
     let effective = crate::resource_metadata(resource, Some(actor.principal()));
     value["permissions"] = effective["permissions"].clone();
-    value["actions"]=json!(registry.actions.iter().filter(|((kind,_),action)|kind==&resource.plural_name && actor.may_run(action)).map(|((_,name),_)|json!({"name":name,"label":crate::python_title(name),"methods":["POST"],"detail":true,"url":format!("/api/admin/{}/{{id}}/actions/{}/",resource.plural_name,name)})).collect::<Vec<_>>());
+    value["actions"] = json!(
+        registry
+            .actions
+            .iter()
+            .filter(|((kind, name), action)| {
+                kind == &resource.plural_name && actor.may_run_action(kind, name, action)
+            })
+            .map(|((kind, name), action)| action.details.metadata(kind, name))
+            .collect::<Vec<_>>()
+    );
     value
+}
+impl ActionDetails {
+    /// The admin's description of the action: where to POST it (`:id` stands
+    /// for the record), how to present it, and when it applies.
+    #[must_use]
+    pub fn metadata(&self, kind: &str, name: &str) -> Value {
+        let label = self
+            .label
+            .clone()
+            .unwrap_or_else(|| crate::python_title(&name.replace('_', " ")));
+        let mut value = json!({"name":name,"label":label,"method":"post","methods":["POST"],"detail":true,"url":format!("/api/admin/{kind}/:id/actions/{name}/")});
+        for (key, detail) in [
+            ("icon", &self.icon),
+            ("description", &self.description),
+            ("confirm", &self.confirm),
+        ] {
+            if let Some(detail) = detail {
+                value[key] = json!(detail);
+            }
+        }
+        if !self.when.is_empty() {
+            // The admin evaluates `instance.<field>[.in|.isnull]` against the record.
+            value["when"] = Value::Object(
+                self.when
+                    .iter()
+                    .map(|(lookup, expected)| {
+                        let path = match lookup.split_once("__") {
+                            Some((field, operator)) => format!("instance.{field}.{operator}"),
+                            None => format!("instance.{lookup}"),
+                        };
+                        (path, expected.clone())
+                    })
+                    .collect(),
+            );
+        }
+        if !self.parameters.is_empty() {
+            value["parameters"] = Value::Object(self.parameters.clone());
+        }
+        value
+    }
+    /// Whether a record meets the action's `when` lookups.
+    #[must_use]
+    pub fn applies_to(&self, record: &Value) -> bool {
+        self.when.iter().all(|(lookup, expected)| {
+            let (field, operator) = lookup.split_once("__").unwrap_or((lookup, "exact"));
+            let actual = &record[field];
+            match operator {
+                "in" => expected
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|value| same(actual, value))),
+                "isnull" => actual.is_null() == (expected == &Value::Bool(true)),
+                _ => same(actual, expected),
+            }
+        })
+    }
+    /// Field errors for required parameters the request left out or empty.
+    #[must_use]
+    pub fn missing(&self, data: &Value) -> crate::FieldErrors {
+        self.parameters
+            .iter()
+            .filter(|(_, spec)| spec["required"] == true)
+            .filter(|(name, _)| match &data[name.as_str()] {
+                Value::Null => true,
+                Value::String(text) => text.trim().is_empty(),
+                _ => false,
+            })
+            .map(|(name, _)| (name.clone(), vec!["This field is required.".to_owned()]))
+            .collect()
+    }
+}
+/// Scalars compare by value whatever their JSON type, so `"5"` matches `5`.
+fn same(actual: &Value, expected: &Value) -> bool {
+    let text = |value: &Value| match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(_) | Value::Bool(_) => Some(value.to_string()),
+        _ => None,
+    };
+    actual == expected || (text(actual).is_some() && text(actual) == text(expected))
+}
+/// Admin field metadata for an action parameter.
+fn parameter_metadata(name: &str, spec: &Value) -> Result<Value, String> {
+    let Value::Object(spec) = spec else {
+        return Err(format!("parameter {name} must be an object"));
+    };
+    if let Some(key) = spec.keys().find(|key| {
+        !["type", "label", "description", "required", "choices"].contains(&key.as_str())
+    }) {
+        return Err(format!("parameter {name} has an unknown key: {key}"));
+    }
+    let typ = match spec.get("type") {
+        None => "string",
+        Some(Value::String(typ)) if typ == "datetime" => "date_time",
+        Some(Value::String(typ)) => typ,
+        Some(_) => return Err(format!("parameter {name} has a non-text type")),
+    };
+    let kind: FieldKind = serde_json::from_value(json!(typ))
+        .ok()
+        .filter(|kind| *kind != FieldKind::Relation && *kind != FieldKind::File)
+        .ok_or_else(|| format!("parameter {name} has an unsupported type: {typ}"))?;
+    let required = match spec.get("required") {
+        None => false,
+        Some(Value::Bool(required)) => *required,
+        Some(_) => return Err(format!("parameter {name}: required must be true or false")),
+    };
+    let text = |key: &str| match spec.get(key) {
+        None => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(format!("parameter {name}: {key} must be text")),
+    };
+    let label = text("label")?.unwrap_or_else(|| crate::python_title(&name.replace('_', " ")));
+    let description = text("description")?;
+    let typ = if kind == FieldKind::DateTime {
+        json!("datetime")
+    } else {
+        serde_json::to_value(&kind).unwrap_or(Value::Null)
+    };
+    let mut field = json!({"name":name,"label":label,"description":description,"type":typ,"read_only":false,"required":required,"nullable":!required,"null":!required,"many":false,"ui":true,"hidden":false,"deferred":false,"sortable":false,"filterable":false});
+    match spec.get("choices") {
+        None => {}
+        Some(Value::Array(items)) => {
+            let choices = items
+                .iter()
+                .map(|item| match item {
+                    Value::Object(choice) if choice.get("id").is_some_and(|id| !id.is_object() && !id.is_array()) => Ok(json!({"id":choice["id"],"label":choice.get("label").unwrap_or(&choice["id"])})),
+                    Value::String(_) | Value::Number(_) | Value::Bool(_) => Ok(json!({"id":item,"label":item})),
+                    _ => Err(format!("parameter {name} has a malformed choice")),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            field["choices"] = json!(choices);
+        }
+        Some(_) => return Err(format!("parameter {name}: choices must be a list")),
+    }
+    Ok(field)
 }

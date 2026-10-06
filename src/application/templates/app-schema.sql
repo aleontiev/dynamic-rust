@@ -42,3 +42,19 @@ CREATE TABLE IF NOT EXISTS app_google_states (
 );
 CREATE INDEX IF NOT EXISTS app_google_states_expires ON app_google_states(expires);
 ALTER TABLE app_google_states ADD COLUMN IF NOT EXISTS next text;
+CREATE TABLE IF NOT EXISTS app_integration_secrets (
+    provider text PRIMARY KEY,
+    client_secret text,
+    access_token text,
+    refresh_token text,
+    expires timestamptz,
+    updated timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS app_integration_states (
+    digest text PRIMARY KEY,
+    provider text NOT NULL,
+    user_id uuid NOT NULL REFERENCES app_records(id) ON DELETE CASCADE,
+    next text,
+    expires timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS app_integration_states_expires ON app_integration_states(expires);

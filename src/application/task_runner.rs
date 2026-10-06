@@ -1,9 +1,7 @@
-//! Durable at-least-once business tasks. Invoke tick from a scheduled, IAM-only
-//! Lambda or a native loop. External providers must honor the task idempotency key.
-use super::{
-    App, DOCUMENT,
-    extensions::{Context, lock},
-};
+//! Durable at-least-once business tasks. Invoke [`drain`] from a scheduled,
+//! IAM-only Lambda, or [`tick`] from a native loop. External providers must
+//! honor the task idempotency key.
+use super::{App, DOCUMENT, extensions::Context};
 use crate::ApiError;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -20,7 +18,8 @@ pub async fn tick(app: &App) -> Result<bool, ApiError> {
     };
     let work = async {
         let mut tx = app.pool.begin().await.map_err(ApiError::internal)?;
-        lock(&mut tx).await?;
+        // The application write lock is taken at the handler's first write, so
+        // calls to outside services before it do not hold up the app's users.
         let live:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM app_tasks WHERE id=$1 AND lease_token=$2 AND lease_until>now() AND state='running')").bind(id).bind(token).fetch_one(&mut *tx).await.map_err(ApiError::internal)?;
         if !live {
             return Err(ApiError::Conflict("Task lease expired".into()));
@@ -39,7 +38,12 @@ pub async fn tick(app: &App) -> Result<bool, ApiError> {
         let handler = app.registry.tasks.get(&name).ok_or(ApiError::NotFound)?;
         let result = handler
             .run(
-                &mut Context::new(&mut tx, &app.registry, app.actor(&user).await?),
+                &mut Context::deferred(
+                    &mut tx,
+                    &app.registry,
+                    app.actor(&user).await?,
+                    app.pool.clone(),
+                ),
                 json!({"task_id":id,"idempotency_key":key,"data":input}),
             )
             .await?;
@@ -56,4 +60,19 @@ pub async fn tick(app: &App) -> Result<bool, ApiError> {
         }
     }
     Ok(true)
+}
+
+/// Execute queued tasks one after another until none is due or `budget` has
+/// passed, and return how many ran. A task started near the end of the budget
+/// may run for up to 60 seconds more, so give the host that much headroom.
+///
+/// # Errors
+/// Returns database errors from claiming work.
+pub async fn drain(app: &App, budget: std::time::Duration) -> Result<usize, ApiError> {
+    let started = std::time::Instant::now();
+    let mut processed = 0;
+    while started.elapsed() < budget && tick(app).await? {
+        processed += 1;
+    }
+    Ok(processed)
 }
