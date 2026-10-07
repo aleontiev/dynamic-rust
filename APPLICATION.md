@@ -293,8 +293,9 @@ the host's timeout — and queue a task for them instead.
 `context.http()` a shared client with 10 s connect and 25 s request timeouts —
 no dependency to add. Use it from tasks.
 
-Services that sign in with OAuth 2 (QuickBooks Online, Xero, Google, Slack, ...)
-are registered as **integrations**:
+Every outside service the app talks to is registered as an **integration**,
+whichever way it lets the app in. Services that sign in with OAuth 2 (QuickBooks
+Online, Xero, Uber, Google, Slack, ...) use `Integration::oauth2`:
 
 ```rust
 use dynamic_rust::application::extensions::Integration;
@@ -325,6 +326,31 @@ parameters to the consent page (Google's `access_type=offline`), and
 `.client_secret_in_body()` sends the credentials as form fields for services
 that refuse HTTP Basic.
 
+Services that issue an API token (key) instead use `Integration::token`; an
+administrator pastes the token into the provider record and presses
+**Connect**, which requests the `check` path with it and marks the provider
+`connected` only when the service answers 2xx (otherwise `error`, with the
+service's answer). **Disconnect** forgets the token. The token is sent as
+`Authorization: Bearer <token>` unless `.token_header` says otherwise:
+
+```rust
+registry.integration(
+    Integration::token("ledger", "Ledger API")
+        .describe("Pulls collections and pushes receipts.")
+        .token_header("Authorization", "JWT {token}")
+        .base_url("https://api.ledger.example")
+        .stage_base_url("dev", "https://api.ledger.dev")
+        .check("/v0/users/?per_page=1"),
+)?;
+```
+
+Either kind may name where the service's API is: `.base_url` by default, and
+`.stage_base_url(stage, url)` while the app runs as that stage (`APP_STAGE`:
+`dev` or `production`; unset means `dev`). The provider record shows that
+**Default Base URL**, and an administrator may enter a **Base URL** to use
+another tenant, sandbox or server instead; changing a token provider's base URL
+asks for Connect again.
+
 Code uses the connection from a task:
 
 ```rust
@@ -345,6 +371,24 @@ people, and the provider record's `status` becomes `error` with the reason, so
 an administrator knows to connect it again. The connection belongs to the app,
 not to the person whose action queued the task: decide in code who may start
 work that uses it.
+
+A connection's `base_url` is the record's Base URL or the integration's
+default, and a path starting with `/` is requested under it, with the
+credentials: `ledger.get("/v0/collections/?page=1")`, `ledger.post(...)`,
+`.put`, `.patch` and `.delete`.
+
+### Keeping records in step
+
+A model whose records are kept in step with an outside service declares
+`.external_id()`: a read-only, unique `external_id` field holding each record's
+id in the service. People see it but cannot set it. To bring a record in, a task
+calls `context.upsert_external("vendors", &remote_id, fields)`, which updates the
+record with that `external_id` or creates it (as the app, read-only fields
+included), so pulling the same record twice never duplicates it. To send a
+record out, create it in the service, then save the id the service returns
+with `context.elevated().update(kind, id, json!({"external_id": remote_id}))`;
+a record with an `external_id` is updated in the service rather than created
+again.
 
 ## Host
 

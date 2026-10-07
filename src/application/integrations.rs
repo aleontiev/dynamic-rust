@@ -1,14 +1,24 @@
-//! OAuth 2 connections to outside services: accounting, chat, storage.
+//! Connections to outside services: accounting, rides, chat, other APIs.
 //!
 //! An app registers each service it talks to with [`Integration`]. Every
-//! registered integration is a `providers` record whose `integration` names it:
-//! administrators (anyone whose roles grant `providers` `update`) enter the
-//! client ID and secret from the service's developer console, register the
-//! record's `redirect_uri` there, and press **Connect**. The service sends the browser back to
-//! `/api/integrations/<name>/callback`, the runtime exchanges the code for tokens
-//! and keeps them in `app_integration_secrets`, which no API returns. Code uses
-//! the connection through [`Context::integration`], which refreshes the access
-//! token when it is about to expire.
+//! registered integration is a `providers` record whose `integration` names it,
+//! and administrators (anyone whose roles grant `providers` `update`) connect it
+//! there:
+//!
+//! - **OAuth 2** ([`Integration::oauth2`]): they enter the client ID and secret
+//!   from the service's developer console, register the record's
+//!   `redirect_uri` there, and press **Connect**. The service sends the browser
+//!   back to `/api/integrations/<name>/callback`, and the runtime exchanges the
+//!   code for tokens.
+//! - **Token** ([`Integration::token`]): they paste an API token (key) the
+//!   service issued and press **Connect**, which checks it against the service.
+//!
+//! Either kind may name the service's base URL for each stage the app runs in
+//! (`APP_STAGE`: `dev` or `production`); an administrator may replace it on the
+//! record (another tenant, a sandbox). Secrets and tokens are kept in
+//! `app_integration_secrets`, which no API returns. Code uses the connection
+//! through [`Context::integration`], which refreshes an OAuth access token when
+//! it is about to expire.
 use super::{App, DOCUMENT, extensions::Context, hash, random, user};
 use crate::{ApiError, FieldErrors};
 use axum::{
@@ -31,13 +41,35 @@ pub enum ClientAuth {
     Body,
 }
 
-/// A service the app connects to with OAuth 2 authorization codes.
+/// How a service lets the app in.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Auth {
+    /// OAuth 2 authorization codes, with refreshed access tokens.
+    #[default]
+    OAuth2,
+    /// A token (API key) an administrator pastes in, sent on every request.
+    Token,
+}
+
+/// A service the app connects to.
 #[derive(Clone, Debug)]
 #[must_use]
 pub struct Integration {
     pub name: String,
     pub label: String,
     pub description: Option<String>,
+    pub auth: Auth,
+    /// The service's API location when no stage-specific one applies.
+    pub base_url: Option<String>,
+    /// The API location for a stage (`dev`, `production`), e.g. a sandbox.
+    pub stage_base_urls: BTreeMap<String, String>,
+    /// A token is sent in this header…
+    pub token_header: String,
+    /// …formatted like this, with `{token}` replaced by the token.
+    pub token_format: String,
+    /// A path under the base URL that answers 2xx to a valid token; Connect
+    /// requests it to check the token before marking the provider connected.
+    pub check: Option<String>,
     pub authorize_url: String,
     pub token_url: String,
     pub scopes: Vec<String>,
@@ -57,12 +89,69 @@ impl Integration {
             name: name.into(),
             label: label.into(),
             description: None,
+            auth: Auth::OAuth2,
+            base_url: None,
+            stage_base_urls: BTreeMap::new(),
+            token_header: "Authorization".into(),
+            token_format: "Bearer {token}".into(),
+            check: None,
             authorize_url: String::new(),
             token_url: String::new(),
             scopes: vec![],
             authorize_params: BTreeMap::new(),
             account_params: vec![],
             client_auth: ClientAuth::Basic,
+        }
+    }
+    /// A service that takes a token (API key) an administrator pastes in, sent
+    /// as `Authorization: Bearer <token>` unless [`Self::token_header`] says
+    /// otherwise.
+    pub fn token(name: &str, label: &str) -> Self {
+        Self {
+            auth: Auth::Token,
+            ..Self::oauth2(name, label)
+        }
+    }
+    /// How a token is sent: the header, and its value with `{token}` standing
+    /// for the token, e.g. `("Authorization", "JWT {token}")` or
+    /// `("X-Api-Key", "{token}")`.
+    pub fn token_header(mut self, header: &str, format: &str) -> Self {
+        self.token_header = header.into();
+        self.token_format = format.into();
+        self
+    }
+    /// The service's API location, used when no stage-specific one applies.
+    pub fn base_url(mut self, url: &str) -> Self {
+        self.base_url = Some(url.trim_end_matches('/').into());
+        self
+    }
+    /// The API location while the app runs as `stage` (`dev` or `production`),
+    /// e.g. a sandbox for `dev`.
+    pub fn stage_base_url(mut self, stage: &str, url: &str) -> Self {
+        self.stage_base_urls
+            .insert(stage.into(), url.trim_end_matches('/').into());
+        self
+    }
+    /// A path under the base URL that answers 2xx to a valid token (one page
+    /// of something the token may read); Connect requests it before marking a
+    /// token provider connected.
+    pub fn check(mut self, path: &str) -> Self {
+        self.check = Some(path.into());
+        self
+    }
+    /// The API location for the stage the app runs in, before an
+    /// administrator's override.
+    #[must_use]
+    pub fn default_base_url(&self) -> Option<String> {
+        self.stage_base_urls
+            .get(&stage())
+            .or(self.base_url.as_ref())
+            .cloned()
+    }
+    pub(super) fn kind(&self) -> &'static str {
+        match self.auth {
+            Auth::OAuth2 => "oauth2",
+            Auth::Token => "token",
         }
     }
     pub fn authorize_url(mut self, url: &str) -> Self {
@@ -104,31 +193,114 @@ impl Integration {
         if self.label.trim().is_empty() {
             return Err(invalid("give it a label"));
         }
-        for url in [&self.authorize_url, &self.token_url] {
-            let parsed =
-                url::Url::parse(url).map_err(|_| invalid("set HTTPS authorize and token URLs"))?;
-            let loopback = matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"));
-            if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
-                return Err(invalid("authorize and token URLs must use HTTPS"));
+        for (stage, url) in self
+            .stage_base_urls
+            .iter()
+            .map(|(stage, url)| (Some(stage), url))
+            .chain(self.base_url.iter().map(|url| (None, url)))
+        {
+            if stage.is_some_and(|stage| !super::extensions::identifier(stage)) {
+                return Err(invalid("name stages like dev and production"));
+            }
+            base_url(url).map_err(|message| invalid(&format!("base URL: {message}")))?;
+        }
+        match self.auth {
+            Auth::OAuth2 => {
+                for url in [&self.authorize_url, &self.token_url] {
+                    if !secure(url) {
+                        return Err(invalid("authorize and token URLs must use HTTPS"));
+                    }
+                }
+            }
+            Auth::Token => {
+                if reqwest::header::HeaderName::from_bytes(self.token_header.as_bytes()).is_err()
+                    || !self.token_format.contains("{token}")
+                {
+                    return Err(invalid(
+                        "send the token in a valid header whose value contains {token}",
+                    ));
+                }
+                if self
+                    .check
+                    .as_ref()
+                    .is_some_and(|path| !path.starts_with('/'))
+                {
+                    return Err(invalid("the check is a path starting with /"));
+                }
             }
         }
         Ok(())
     }
 }
+/// Whether `url` is HTTPS, or plain HTTP to this machine (tests' stand-ins).
+fn secure(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|parsed| {
+        let loopback = matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"));
+        parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback)
+    })
+}
+/// A base URL as kept: an HTTPS location without credentials, query or
+/// fragment, and without a trailing slash.
+fn base_url(url: &str) -> Result<String, String> {
+    let url = url.trim();
+    let parsed = url::Url::parse(url)
+        .map_err(|_| "enter a full URL such as https://api.example.com".to_owned())?;
+    if !secure(url) {
+        return Err("use an https:// URL".into());
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || url.len() > 500
+    {
+        return Err(
+            "give only the location, up to 500 characters, without credentials or a query".into(),
+        );
+    }
+    Ok(url.trim_end_matches('/').to_owned())
+}
+/// The stage this app runs as: `APP_STAGE`, or `dev` when unset (local runs
+/// and tests).
+fn stage() -> String {
+    std::env::var("APP_STAGE")
+        .ok()
+        .map(|stage| stage.trim().to_owned())
+        .filter(|stage| !stage.is_empty())
+        .unwrap_or_else(|| "dev".into())
+}
 
-/// A live connection: a current access token and the account it reaches.
+/// A live connection: a current access token (or the saved token), where the
+/// service is, and the account it reaches.
 #[derive(Clone, Debug)]
 pub struct Connection {
     pub name: String,
     pub access_token: String,
+    /// The service's API location for this app: the provider record's base
+    /// URL, else the integration's default for the stage; empty if neither.
+    pub base_url: String,
     /// The account parameters the service identified at connection time,
     /// e.g. `{"realmId": "9130..."}` for `QuickBooks`.
     pub account: Value,
+    header: String,
+    value: String,
 }
 impl Connection {
-    /// A request to the service carrying the access token.
+    /// `path` under the base URL; a full URL is kept as it is.
+    #[must_use]
+    pub fn url(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            format!("{}{path}", self.base_url)
+        } else {
+            path.to_owned()
+        }
+    }
+    /// A request to the service carrying the credentials. A `url` starting with
+    /// `/` is a path under the base URL.
     pub fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
-        http().request(method, url).bearer_auth(&self.access_token)
+        http()
+            .request(method, self.url(url))
+            .header(self.header.as_str(), self.value.as_str())
     }
     pub fn get(&self, url: &str) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::GET, url)
@@ -136,6 +308,42 @@ impl Connection {
     pub fn post(&self, url: &str) -> reqwest::RequestBuilder {
         self.request(reqwest::Method::POST, url)
     }
+    pub fn put(&self, url: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::PUT, url)
+    }
+    pub fn patch(&self, url: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::PATCH, url)
+    }
+    pub fn delete(&self, url: &str) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::DELETE, url)
+    }
+}
+/// A connection to `integration` with `token`, at the record's base URL or
+/// the integration's default.
+fn connection(integration: &Integration, record: &Value, token: String) -> Connection {
+    let (header, value) = match integration.auth {
+        Auth::OAuth2 => ("Authorization".to_owned(), format!("Bearer {token}")),
+        Auth::Token => (
+            integration.token_header.clone(),
+            integration.token_format.replace("{token}", &token),
+        ),
+    };
+    Connection {
+        name: integration.name.clone(),
+        base_url: effective_base_url(integration, record),
+        access_token: token,
+        account: record["account"].clone(),
+        header,
+        value,
+    }
+}
+fn effective_base_url(integration: &Integration, record: &Value) -> String {
+    record["base_url"]
+        .as_str()
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .or_else(|| integration.default_base_url())
+        .unwrap_or_default()
 }
 
 /// The shared outbound HTTP client: 10 s to connect, 25 s per request.
@@ -167,7 +375,7 @@ pub(super) async fn sync_providers(
     integrations: &BTreeMap<String, Integration>,
 ) -> Result<(), ApiError> {
     for integration in integrations.values() {
-        let presentation = json!({"kind":"oauth2","description":integration.description});
+        let presentation = json!({"kind":integration.kind(),"description":integration.description});
         let updated = sqlx::query(
             "UPDATE app_records SET data=data||$2,updated=now() WHERE kind='providers' AND data->>'integration'=$1 AND NOT (data @> $2)",
         )
@@ -199,15 +407,23 @@ pub(super) async fn sync_providers(
 }
 
 /// Add what a provider record shows but does not store: the redirect URI to
-/// register with the service, and whether a client secret is saved.
+/// register with an OAuth service, the base URL used when the record names
+/// none, and whether a client secret or token is saved.
 pub(super) fn present(app: &App, record: &mut Value, secret_saved: bool) {
     let Some(name) = record["integration"].as_str().map(str::to_owned) else {
         return;
     };
-    if app.registry.integrations.contains_key(&name) {
-        record["redirect_uri"] = json!(callback_url(&app.origin, &name));
+    let integration = app.registry.integrations.get(&name);
+    let token = integration.is_some_and(|integration| integration.auth == Auth::Token);
+    if let Some(integration) = integration {
+        if !token {
+            record["redirect_uri"] = json!(callback_url(&app.origin, &name));
+        }
+        record["default_base_url"] = json!(integration.default_base_url());
     }
-    record["client_secret"] = json!(if secret_saved { "Saved" } else { "" });
+    let saved = |shown: bool| json!(if secret_saved && shown { "Saved" } else { "" });
+    record["client_secret"] = saved(!token);
+    record["token"] = saved(token);
 }
 /// Whether a provider record has a saved client secret.
 pub(super) fn secret_saved(saved: &[String], record: &Value) -> bool {
@@ -324,12 +540,15 @@ pub(super) async fn update(
         data["enabled"] = json!(provider_enabled(enabled)?);
     }
     let Some(name) = integration else {
-        for field in ["client_id", "client_secret"] {
+        for field in ["client_id", "client_secret", "token", "base_url"] {
             if input
                 .get(field)
                 .is_some_and(|value| !value.is_null() && value != "")
             {
-                return Err(invalid(field, "Only integrations take client credentials."));
+                return Err(invalid(
+                    field,
+                    "Only providers from the app's code take credentials or a base URL.",
+                ));
             }
         }
         sqlx::query(
@@ -342,13 +561,92 @@ pub(super) async fn update(
         .map_err(ApiError::internal)?;
         return Ok(());
     };
-    credentials(connection, &name, &current, input, &mut data).await?;
+    let token = current["kind"] == "token";
+    // A token provider takes no client credentials, an OAuth one no token.
+    let (wrong, kind): (&[&str], _) = if token {
+        (&["client_id", "client_secret"], "an OAuth")
+    } else {
+        (&["token"], "a token")
+    };
+    for &field in wrong {
+        if input
+            .get(field)
+            .is_some_and(|value| !value.is_null() && value != "" && value != "Saved")
+        {
+            return Err(invalid(field, &format!("Only {kind} provider takes this.")));
+        }
+    }
+    let moved = match input.get("base_url") {
+        None => false,
+        Some(Value::Null) => data
+            .as_object_mut()
+            .and_then(|o| o.remove("base_url"))
+            .is_some(),
+        Some(Value::String(url)) if url.trim().is_empty() => data
+            .as_object_mut()
+            .and_then(|o| o.remove("base_url"))
+            .is_some(),
+        Some(Value::String(url)) => {
+            let url =
+                base_url(url).map_err(|message| invalid("base_url", &capitalize(&message)))?;
+            let moved = current["base_url"].as_str() != Some(url.as_str());
+            data["base_url"] = json!(url);
+            moved
+        }
+        Some(_) => return Err(invalid("base_url", "Must be text.")),
+    };
+    if token {
+        save_token(connection, &name, input, moved, &mut data).await?;
+    } else {
+        credentials(connection, &name, &current, input, &mut data).await?;
+    }
     sqlx::query("UPDATE app_records SET data=$2,updated=now() WHERE kind='providers' AND id=$1")
         .bind(id)
         .bind(&data)
         .execute(&mut *connection)
         .await
         .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+fn capitalize(message: &str) -> String {
+    let mut chars = message.chars();
+    chars.next().map_or_else(String::new, |first| {
+        format!("{}{}.", first.to_uppercase(), chars.as_str())
+    })
+}
+/// Save a token provider's new token. A new token, or a new base URL, needs
+/// checking again, so the provider waits to be connected.
+async fn save_token(
+    connection: &mut PgConnection,
+    name: &str,
+    input: &Value,
+    moved: bool,
+    data: &mut Value,
+) -> Result<(), ApiError> {
+    let token = match input.get("token") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) if text.trim().is_empty() || text == "Saved" => None,
+        Some(Value::String(text)) if text.len() <= 4000 => Some(text.trim().to_owned()),
+        Some(_) => return Err(invalid("token", "Must be text up to 4000 characters.")),
+    };
+    if let Some(token) = &token {
+        sqlx::query("INSERT INTO app_integration_secrets(provider,client_secret) VALUES($1,$2) ON CONFLICT(provider) DO UPDATE SET client_secret=EXCLUDED.client_secret,access_token=NULL,refresh_token=NULL,expires=NULL,updated=now()")
+            .bind(name).bind(token).execute(&mut *connection).await.map_err(ApiError::internal)?;
+    }
+    if token.is_none() && !moved {
+        return Ok(());
+    }
+    let has_token: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM app_integration_secrets WHERE provider=$1 AND client_secret IS NOT NULL)")
+        .bind(name).fetch_one(&mut *connection).await.map_err(ApiError::internal)?;
+    data["status"] = json!(if has_token {
+        "disconnected"
+    } else {
+        "needs_credentials"
+    });
+    data["account"] = json!({});
+    data["error"] = Value::Null;
+    data["connected_at"] = Value::Null;
     Ok(())
 }
 
@@ -412,7 +710,7 @@ async fn credentials(
 pub(super) fn actions() -> Value {
     json!([
         {"name":"connect","label":"Connect","icon":"link-variant","method":"post","methods":["POST"],"detail":true,"navigate":true,
-         "description":"Sign in to the service and allow this app to use it.",
+         "description":"Sign in to the service and allow this app to use it, or check the saved token with it.",
          "url":"/api/admin/providers/:id/actions/connect/",
          "when":{"instance.status.in":["disconnected","connected","error"]}},
         {"name":"disconnect","label":"Disconnect","icon":"link-variant-off","method":"post","methods":["POST"],"detail":true,
@@ -452,6 +750,9 @@ pub(super) async fn action(
         .integrations
         .get(&provider)
         .ok_or(ApiError::NotFound)?;
+    if integration.auth == Auth::Token {
+        return token_action(app, &person, id, record, integration, name).await;
+    }
     match name {
         "connect" => {
             let client_id = record["client_id"].as_str().unwrap_or_default();
@@ -510,6 +811,91 @@ pub(super) async fn action(
             .map_err(ApiError::internal)?;
             tx.commit().await.map_err(ApiError::internal)?;
             Ok(json!({"provider":super::public_record("providers", record)}))
+        }
+        _ => Err(ApiError::NotFound),
+    }
+}
+
+/// Connect a token provider by checking its token with the service, or
+/// disconnect it by forgetting the token.
+async fn token_action(
+    app: &App,
+    person: &Value,
+    id: Uuid,
+    record: Value,
+    integration: &Integration,
+    name: &str,
+) -> Result<Value, ApiError> {
+    let provider = &integration.name;
+    // Connecting stamps `connected_at` with the database's clock.
+    let update = |patch: Value, connected: bool| async move {
+        let record: Value = sqlx::query_scalar(&format!(
+            "UPDATE app_records SET data=data||$2||CASE WHEN $3 THEN jsonb_build_object('connected_at',now()) ELSE '{{}}'::jsonb END,updated=now() WHERE kind='providers' AND id=$1 RETURNING {DOCUMENT}"
+        ))
+        .bind(id)
+        .bind(patch)
+        .bind(connected)
+        .fetch_one(&app.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        Ok::<_, ApiError>(json!({"provider":super::public_record("providers", record)}))
+    };
+    match name {
+        "connect" => {
+            let token: Option<String> = sqlx::query_scalar(
+                "SELECT client_secret FROM app_integration_secrets WHERE provider=$1",
+            )
+            .bind(provider)
+            .fetch_optional(&app.pool)
+            .await
+            .map_err(ApiError::internal)?
+            .flatten();
+            let Some(token) = token else {
+                return Err(ApiError::Conflict(
+                    "Enter the token the service issued first.".into(),
+                ));
+            };
+            let connection = connection(integration, &record, token);
+            if connection.base_url.is_empty() {
+                return Err(ApiError::Conflict(
+                    "Enter the service's base URL first.".into(),
+                ));
+            }
+            if let Some(check) = &integration.check {
+                let refused = match connection.get(check).send().await {
+                    Ok(response) if response.status().is_success() => None,
+                    Ok(response) => Some(format!(
+                        "the service answered {} at {}",
+                        response.status(),
+                        connection.url(check)
+                    )),
+                    Err(_) => Some(format!("{} could not be reached", connection.base_url)),
+                };
+                if let Some(message) = refused {
+                    let message =
+                        format!("Connecting failed: {message}. Check the token and base URL.");
+                    update(
+                        json!({"status":"error","error":message,"connected_at":null}),
+                        false,
+                    )
+                    .await?;
+                    return Err(ApiError::Conflict(message));
+                }
+            }
+            update(
+                json!({"status":"connected","error":null,"connected_by":person["id"]}),
+                true,
+            )
+            .await
+        }
+        "disconnect" => {
+            sqlx::query("UPDATE app_integration_secrets SET client_secret=NULL,access_token=NULL,refresh_token=NULL,expires=NULL,updated=now() WHERE provider=$1")
+                .bind(provider).execute(&app.pool).await.map_err(ApiError::internal)?;
+            update(
+                json!({"status":"needs_credentials","account":{},"error":null,"connected_at":null}),
+                false,
+            )
+            .await
         }
         _ => Err(ApiError::NotFound),
     }
@@ -733,6 +1119,23 @@ async fn current(
             integration.label
         )));
     }
+    if integration.auth == Auth::Token {
+        // A token is used once an administrator has connected it.
+        if record["status"] != "connected" {
+            return Err(not_connected());
+        }
+        let token: Option<String> = sqlx::query_scalar(
+            "SELECT client_secret FROM app_integration_secrets WHERE provider=$1",
+        )
+        .bind(name)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(ApiError::internal)?
+        .flatten();
+        return token
+            .map(|token| self::connection(integration, &record, token))
+            .ok_or_else(not_connected);
+    }
     // Lock the tokens: a refresh token may be single-use.
     let row: Option<TokenRow> = sqlx::query_as(
         "SELECT access_token,refresh_token,client_secret,coalesce(expires<now()+interval '60 seconds',false) FROM app_integration_secrets WHERE provider=$1 FOR UPDATE",
@@ -744,13 +1147,8 @@ async fn current(
     let Some((Some(access_token), refresh_token, client_secret, expiring)) = row else {
         return Err(not_connected());
     };
-    let account = record["account"].clone();
     if !expiring {
-        return Ok(Connection {
-            name: name.clone(),
-            access_token,
-            account,
-        });
+        return Ok(self::connection(integration, &record, access_token));
     }
     let Some(refresh_token) = refresh_token else {
         return Err(not_connected());
@@ -768,11 +1166,7 @@ async fn current(
     {
         Ok(tokens) => {
             store(connection, name, &tokens).await?;
-            Ok(Connection {
-                name: name.clone(),
-                access_token: tokens.access_token,
-                account,
-            })
+            Ok(self::connection(integration, &record, tokens.access_token))
         }
         Err(message) => {
             sqlx::query("UPDATE app_records SET data=data||jsonb_build_object('status','error','error',$2::text),updated=now() WHERE kind='providers' AND data->>'integration'=$1")

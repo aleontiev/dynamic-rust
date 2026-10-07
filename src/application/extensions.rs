@@ -2,7 +2,7 @@
 //! Registered, transaction-backed application extensions. All writes, hooks,
 //! actions and task effects share a transaction. No cloud credentials are needed.
 use super::DOCUMENT;
-pub use super::integrations::{Connection, Integration};
+pub use super::integrations::{Auth, Connection, Integration};
 use crate::{
     AccessMap, AccessTargets, ApiError, Field, FieldKind, PermissionFilter, Principal,
     QueryFeatures, RelationLink, Resource,
@@ -346,6 +346,18 @@ impl Model {
         self.unique
             .push(fields.iter().map(|s| (*s).into()).collect());
         self
+    }
+    /// Records of this model are kept in step with an outside service: a
+    /// read-only, unique `external_id` holds each record's id there. Sync code
+    /// sets it through [`Context::upsert_external`] or `ctx.elevated()`.
+    pub fn external_id(self) -> Self {
+        self.field("external_id", FieldKind::String)
+            .readonly("external_id")
+            .describe(
+                "external_id",
+                "This record's id in the outside service it is kept in step with.",
+            )
+            .unique(&["external_id"])
     }
     pub fn hook(mut self, hook: impl Hook + 'static) -> Self {
         self.hook = Some(Arc::new(hook));
@@ -855,6 +867,59 @@ impl<'a> Context<'a> {
     pub async fn integration(&mut self, name: &str) -> Result<Connection, ApiError> {
         let pool = self.pool.clone();
         super::integrations::connect(self, pool.as_ref(), name).await
+    }
+    /// Bring in one record from an outside service: update the `kind` record
+    /// whose `external_id` is `external_id` with `input`, or create it, as the
+    /// app (read-only fields included), so pulling the same record again never
+    /// duplicates it. Returns the saved record.
+    ///
+    /// # Errors
+    /// Rejects a model without `external_id` (see [`Model::external_id`]) or a
+    /// blank id, and returns validation, conflict or database errors; the
+    /// caller must roll back on error.
+    pub async fn upsert_external(
+        &mut self,
+        kind: &str,
+        external_id: &str,
+        input: Value,
+    ) -> Result<Value, ApiError> {
+        let synced = self.registry.models.get(kind).is_some_and(|model| {
+            model
+                .resource
+                .fields
+                .iter()
+                .any(|field| field.name == "external_id")
+        });
+        if !synced {
+            return Err(ApiError::Parse(format!(
+                "{kind} has no external_id field; declare the model with .external_id()."
+            )));
+        }
+        let external_id = external_id.trim();
+        if external_id.is_empty() {
+            return Err(ApiError::Parse("An external id is required.".into()));
+        }
+        let Value::Object(mut input) = input else {
+            return Err(ApiError::Parse(
+                "Expected the record's fields as an object.".into(),
+            ));
+        };
+        input.insert("external_id".into(), json!(external_id));
+        // Find and write under the write lock, so two syncs cannot both create.
+        self.lock().await?;
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM app_records WHERE kind=$1 AND data->>'external_id'=$2 ORDER BY created,id LIMIT 1",
+        )
+        .bind(kind)
+        .bind(external_id)
+        .fetch_optional(&mut *self.connection)
+        .await
+        .map_err(ApiError::internal)?;
+        let mut app = self.elevated();
+        match existing {
+            Some(id) => app.update(kind, id, Value::Object(input)).await,
+            None => app.create(kind, Value::Object(input)).await,
+        }
     }
     /// The shared outbound HTTP client (10 s connect and 25 s request
     /// timeouts) for services that need no integration.

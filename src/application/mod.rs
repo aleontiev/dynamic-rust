@@ -236,6 +236,9 @@ fn fields(kind: &str) -> Vec<(&str, &str)> {
             ("client_id", "string"),
             ("client_secret", "string"),
             ("redirect_uri", "string"),
+            ("token", "string"),
+            ("base_url", "string"),
+            ("default_base_url", "string"),
         ],
         "views" => vec![("name", "string"), ("resource", "string"), ("data", "json")],
         _ => vec![("name", "string"), ("data", "json")],
@@ -263,9 +266,10 @@ fn writable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
         ("dashboards", "name" | "data") | ("views", "name" | "resource" | "data") => {
             actor.granted(kind, "update")
         }
-        ("providers", "name" | "kind" | "enabled" | "client_id" | "client_secret") => {
-            actor.granted("providers", "update")
-        }
+        (
+            "providers",
+            "name" | "kind" | "enabled" | "client_id" | "client_secret" | "token" | "base_url",
+        ) => actor.granted("providers", "update"),
         _ => false,
     }
 }
@@ -334,18 +338,29 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
             ("providers",_)=>{
                 let description=match name {
                     "integration"=>"The service in the app's code this provider connects, if any.",
-                    "status"=>"For an integration: needs_credentials until the client ID and secret are saved, then disconnected, connected, or error when access was refused or lost.",
+                    "status"=>"For an integration: needs_credentials until its client ID and secret, or its token, are saved; then disconnected until someone presses Connect; connected; or error when access was refused or lost.",
                     "account"=>"The account this app is connected to, as the service identified it.",
                     "error"=>"Why the last attempt to connect or refresh access failed.",
                     "client_id"=>"The OAuth client ID from the service's developer console.",
                     "client_secret"=>"The OAuth client secret. It is kept privately and never shown again; enter a new one to replace it.",
                     "redirect_uri"=>"Register this exact URL as a redirect URI in the service's developer console.",
+                    "token"=>"The API token (key) the service issued for this app. It is kept privately and never shown again; enter a new one to replace it.",
+                    "base_url"=>"Where the service's API is, when not the default: another tenant, a sandbox or a test server.",
+                    "default_base_url"=>"The service's API location for this environment, used when Base URL is blank.",
                     "enabled"=>"Turn off to stop the app from using this service without disconnecting it.",
                     _=>"",
                 };
                 if !description.is_empty() { field["description"]=json!(description); }
-                if name=="client_secret" { field["secret"]=json!(true); }
-                if name=="client_id" || name=="client_secret" { field["required"]=json!(false); field["nullable"]=json!(true); field["null"]=json!(true); }
+                if name=="client_secret" || name=="token" { field["secret"]=json!(true); }
+                if ["client_id","client_secret","token","base_url"].contains(&name) { field["required"]=json!(false); field["nullable"]=json!(true); field["null"]=json!(true); }
+                // Each kind of integration shows only its own fields.
+                match name {
+                    "client_id"|"client_secret"|"redirect_uri"=>field["depends"]=json!({"kind":"oauth2"}),
+                    "token"=>field["depends"]=json!({"kind":"token"}),
+                    "base_url"|"default_base_url"=>field["depends"]=json!({"integration.isnull":false}),
+                    _=>{}
+                }
+                if name=="default_base_url" { field["hide"]=json!(true); }
             }
             _=>{}
         }
@@ -387,8 +402,11 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
 }
 /// Built-in fields the list endpoint can filter and sort by.
 fn filterable(kind: &str, field: &str) -> bool {
-    // A provider's secret and redirect URI are not stored on the record.
-    if kind == "providers" && ["client_secret", "redirect_uri"].contains(&field) {
+    // A provider's secrets, redirect URI and default base URL are not stored
+    // on the record.
+    if kind == "providers"
+        && ["client_secret", "redirect_uri", "token", "default_base_url"].contains(&field)
+    {
         return false;
     }
     !fields(kind).iter().any(|(name, typ)| {
