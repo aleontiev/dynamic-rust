@@ -634,7 +634,7 @@ pub(super) fn register(registry: &mut Registry) {
     );
     registry.actions.insert(
         ("providers".into(), "disconnect".into()),
-        action("Disconnect", "link-variant-off", "Forget this app's access to the service, and a saved token.", Some("Disconnect this service? Anything that uses it stops working until someone connects it again."), &["disconnected", "connected", "error"], false),
+        action("Disconnect", "link-variant-off", "Forget this app's access to the service, and a saved token.", Some("Disconnect this service? Anything that uses it stops working until someone connects it again."), &["connected", "error"], false),
     );
 }
 /// Provider actions run outside the application write lock, since they call

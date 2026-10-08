@@ -515,9 +515,12 @@ async fn token_providers_connect_by_checking_the_token_and_syncs_keep_outside_id
     assert_eq!(moved["provider"]["status"], "disconnected");
     let (status, _) = request(&app, "POST", &connect, owner, json!({})).await;
     assert_eq!(status, 200);
-    // Clearing it goes back to the default.
+    // Clearing it goes back to the default, connected again.
     let (_, cleared) = request(&app, "PATCH", &detail, owner, json!({"base_url":""})).await;
     assert!(cleared["provider"]["base_url"].is_null());
+    assert_eq!(cleared["provider"]["status"], "disconnected");
+    let (status, _) = request(&app, "POST", &connect, owner, json!({})).await;
+    assert_eq!(status, 200);
 
     // Disconnecting forgets the token.
     let (status, disconnected) = request(
