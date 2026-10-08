@@ -30,7 +30,7 @@ roles come from the user's server-owned `roles` list, never request headers.
 Signing in is for the people the app knows: its superusers (the owners), and
 anyone an administrator added on the Users page — `POST /api/admin/users/`
 with an `email`, an optional `name` (defaulting to the address) and optional
-`roles`, which takes the `users` `create` grant the managed Admin role holds.
+`roles`, which takes the `users` `create` grant (the default Admin role holds it).
 An email link is only sent to such an address (a stranger's request answers
 403 with a message saying to ask an administrator), and Google sign-in for an
 unknown address ends on the sign-in page with the same advice; no account is
@@ -111,11 +111,14 @@ registry.role("Approver", json!({
 
 `registry.migrate` checks each map against the registered models, fields and
 actions — a mistake fails the app's tests and its start instead of quietly
-granting nothing — and creates the role when no role of that name exists.
-Later releases update a shipped role's map only while it still holds the
-defaults the app gave it; once an administrator changes the role, theirs
-stays. Grants in code for the same name still apply; keep the rules people
-should be able to adjust in the map.
+granting nothing — and creates the role once. Shipped roles are ordinary role
+records: later releases update a role's map only while it still holds the
+defaults the app gave it, and an administrator may change, rename or delete it
+— a renamed role is still recognised (its `shipped` name), and a deleted one is
+not created again. Grants in code for the same name still apply; keep the rules
+people should be able to adjust in the map. Removing a model or action from the
+app drops it from every role's map, so the rest still applies and the role can
+be saved again.
 
 Superusers, and holders of a role whose map grants those operations on `roles`
 and `users`, create, edit and delete roles, add and remove users (removing
@@ -129,15 +132,17 @@ remains read-only. Role names must be unique; `*` and `authenticated` are
 reserved. Role entries on a user that are not record ids are still treated as
 role names, so applications that assigned roles by name keep working.
 
-`registry.migrate` provisions a managed **Admin** role granting every
-operation on every resource, users and providers included, and every action;
-its name is fixed. A superuser who signs in holds it, so the owner's own record
-shows and carries full access from the first sign-in. The owner may narrow it
-like any other role and that choice lasts: later releases grant it only what
-the app gained since — a new model, action or built-in resource — once. A role
-still holding the earlier defaults (providers read-only, no actions) is brought
-up to date once; one an owner had customised is left alone. Make other roles
-for narrower access.
+Unless the app ships a role named **Admin** itself, it ships a default Admin
+granting every operation on every resource, users and providers included, and
+every action — an ordinary shipped role: it follows the app's new models and
+actions while untouched, and an administrator may narrow, rename or delete it
+like any other. A superuser who signs in is given it when it exists, so the
+owner's own record shows it. Superusers' access never depends on roles: they
+pass every grant, row filter, action rule and field rule (hidden fields
+included), so the owners — and the platform acting for them — can always see
+and change everything the app lets anyone change. Make the app's own roles for
+everyone else. An Admin role from an earlier version, which was managed apart,
+becomes this ordinary role on the next start.
 
 Signing in with Google also fills a person's `photo` — Google's profile picture
 URL — when they have none yet; a photo already set is kept. Users carry it as a
@@ -246,7 +251,7 @@ Who may run an action comes from two places, with union semantics:
   record must meet: `{"purchase_orders": {"list": true, "read": true,
   "approve": {"approver": "$user.id"}}}` lets its holders approve the orders
   assigned to them and no others. Unknown action names are refused when the
-  role is saved. The managed Admin role holds every action. The role editor
+  role is saved. The default Admin role holds every action. The role editor
   lists each resource's actions under it (`OPTIONS /api/admin/roles/` reports
   them as `actions` on each resource under the `permissions` field), and a
   person sees an action's button only when one of these grants it.

@@ -864,39 +864,18 @@ pub fn configured(
         operator_secret: operator::secret_from_env()?,
     })
 }
-/// The core records a new app database starts with: a Viewer role and the
-/// email sign-in provider. Seeded once: administrators may edit or remove
-/// them, and a redeploy must not undo that. The first Viewer predates access
-/// maps; its map named no resource and granted nothing, so an untouched one is
-/// brought up to date.
+/// The core records a new app database starts with: the email sign-in
+/// provider. Seeded once: administrators may edit or remove it, and a redeploy
+/// must not undo that. Roles are the app's own: it ships them with
+/// `registry.role`, and a default Admin unless it ships its own. Apps created
+/// before then also have a seeded Viewer role, left as it is.
 async fn seed(pool: &PgPool) -> Result<(), ApiError> {
-    let legacy_viewer = json!({"name":"Viewer","permissions":{"list":true,"read":true,"create":false,"update":false,"delete":false}});
-    let read = json!({"list":true,"read":true});
-    for (id, kind, data, replaces) in [
-        (
-            "00000000-0000-0000-0000-000000000001",
-            "roles",
-            json!({"name":"Viewer","permissions":{"users":read,"roles":read,"providers":read}}),
-            legacy_viewer,
-        ),
-        (
-            "00000000-0000-0000-0000-000000000002",
-            "providers",
-            json!({"name":"Email sign-in","kind":"email_magic_link","enabled":true}),
-            Value::Null,
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO app_records(id,kind,data) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,updated=now() WHERE app_records.data=$4",
-        )
-        .bind(Uuid::parse_str(id).unwrap())
-        .bind(kind)
-        .bind(data)
-        .bind(replaces)
+    sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'providers',$2) ON CONFLICT(id) DO NOTHING")
+        .bind(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
+        .bind(json!({"name":"Email sign-in","kind":"email_magic_link","enabled":true}))
         .execute(pool)
         .await
         .map_err(ApiError::internal)?;
-    }
     Ok(())
 }
 async fn bootstrap() -> Result<(), ApiError> {

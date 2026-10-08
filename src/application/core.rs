@@ -301,13 +301,15 @@ async fn role_data(
     )
     .map_err(|message| invalid("permissions", &message))?;
     let mut record = json!({"name":name,"permissions":permissions});
-    // The managed Admin role keeps what it knows about the defaults it holds.
+    // A role the app ships keeps which one it is and the defaults it was given,
+    // which is how a later release tells whether anyone has changed it.
     for key in [
-        "managed",
+        "shipped",
         "description",
+        "default_permissions",
+        "managed",
         "admin_defaults_version",
         "admin_known",
-        "default_permissions",
     ] {
         if let Some(value) = current.get(key) {
             record[key] = value.clone();
@@ -347,7 +349,7 @@ fn page_data(app: &App, kind: &str, current: &Value, input: &Value) -> Result<Va
     Ok(record)
 }
 
-/// Every operation on every resource: what the managed Admin role grants.
+/// Every operation on every resource and every action: the default Admin role.
 pub(crate) fn admin_access_map(registry: &super::extensions::Registry) -> Value {
     let all = json!({"list":true,"read":true,"create":true,"update":true,"delete":true});
     let mut map = serde_json::Map::new();
@@ -425,45 +427,46 @@ fn admin_targets(registry: &super::extensions::Registry) -> BTreeSet<String> {
         .collect()
 }
 
-/// The Admin role that grants everything, created on first use. Its name is
-/// fixed; other roles are the owner's. The owner may narrow it like any other
-/// role, and those choices last: only what the app gains later — a model, an
-/// action, a built-in resource — is granted to it, once. A role still holding
-/// the version 1 defaults is brought up to date once; one an owner had
-/// customised before then is left as it is.
-pub async fn ensure_admin_role(
-    connection: &mut PgConnection,
-    registry: &super::extensions::Registry,
-) -> Result<Uuid, ApiError> {
+/// What the default Admin role says about itself.
+const ADMIN_DESCRIPTION: &str =
+    "Full access to every resource. An ordinary role: change it, or make narrower ones.";
+
+/// The roles the app ships: those it registers ([`Registry::role`]), and an
+/// Admin granting every operation on every resource and every action unless it
+/// registers its own role of that name.
+fn shipped_roles(registry: &super::extensions::Registry) -> Vec<(String, Value, Option<&str>)> {
+    let mut roles: Vec<(String, Value, Option<&str>)> = registry
+        .roles
+        .iter()
+        .map(|(name, permissions)| (name.clone(), permissions.clone(), None))
+        .collect();
+    if !registry
+        .roles
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("admin"))
+    {
+        roles.push((
+            "Admin".into(),
+            admin_access_map(registry),
+            Some(ADMIN_DESCRIPTION),
+        ));
+    }
+    roles
+}
+
+/// An Admin role kept by earlier versions, which granted it whatever the app
+/// gained even after an owner narrowed it: grant that one last time, then make
+/// it an ordinary shipped role holding today's defaults. Left untouched, it
+/// keeps following the app; narrowed, it stays as the owner left it.
+fn adopt_legacy_admin(data: &mut Value, registry: &super::extensions::Registry) {
     let defaults = admin_access_map(registry);
     let targets = admin_targets(registry);
-    let existing: Option<(Uuid, Value)> = sqlx::query_as(
-        "SELECT id,data FROM app_records WHERE kind='roles' AND lower(data->>'name')='admin' ORDER BY created,id LIMIT 1",
-    )
-    .fetch_optional(&mut *connection)
-    .await
-    .map_err(ApiError::internal)?;
-    let Some((id, mut data)) = existing else {
-        let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'roles',$2)")
-            .bind(id)
-            .bind(json!({"name":"Admin","permissions":defaults,"managed":true,
-                "description":"Full access to every resource. Managed by the app; make other roles for narrower access.",
-                "admin_defaults_version":ADMIN_DEFAULTS_VERSION,"admin_known":targets}))
-            .execute(&mut *connection)
-            .await
-            .map_err(ApiError::internal)?;
-        return Ok(id);
-    };
-    let before = data.clone();
     if data["admin_defaults_version"].as_i64().unwrap_or(1) < ADMIN_DEFAULTS_VERSION {
         if legacy_admin_map(&data["permissions"]) {
-            data["permissions"] = defaults;
+            data["permissions"] = defaults.clone();
         }
-        data["admin_defaults_version"] = json!(ADMIN_DEFAULTS_VERSION);
-        data["admin_known"] = json!(targets);
     } else {
-        let mut known: BTreeSet<String> = data["admin_known"]
+        let known: BTreeSet<String> = data["admin_known"]
             .as_array()
             .into_iter()
             .flatten()
@@ -472,7 +475,7 @@ pub async fn ensure_admin_role(
         if !data["permissions"].is_object() {
             data["permissions"] = json!({});
         }
-        for target in targets.difference(&known.clone()) {
+        for target in targets.difference(&known) {
             let permissions = &mut data["permissions"];
             match target.split_once('.') {
                 Some((model, action)) => {
@@ -483,46 +486,87 @@ pub async fn ensure_admin_role(
                 }
                 None => permissions[target.as_str()] = defaults[target.as_str()].clone(),
             }
-            known.insert(target.clone());
         }
-        data["admin_known"] = json!(known);
     }
-    // What the app no longer has can't be granted: drop it, so the map stays
-    // valid (and can be saved again from Roles), and grant it afresh should it
-    // come back.
+    // What the app no longer has can't be granted: drop it, so the map can be
+    // saved again from Roles.
     if let Some(permissions) = data["permissions"].as_object_mut() {
         permissions.retain(|model, _| targets.contains(model));
         for (model, rules) in permissions.iter_mut() {
             if let Some(rules) = rules.as_object_mut() {
                 rules.retain(|operation, _| {
                     crate::ACCESS_OPERATIONS.contains(&operation.as_str())
+                        || operation == crate::FIELD_RULES
                         || targets.contains(&format!("{model}.{operation}"))
                 });
             }
         }
     }
-    if let Some(known) = data["admin_known"].as_array_mut() {
-        known.retain(|target| {
-            target
-                .as_str()
-                .is_some_and(|target| targets.contains(target))
-        });
+    if let Some(object) = data.as_object_mut() {
+        for key in ["managed", "admin_defaults_version", "admin_known"] {
+            object.remove(key);
+        }
     }
-    data["managed"] = json!(true);
-    if data != before {
-        sqlx::query("UPDATE app_records SET data=$2,updated=now() WHERE kind='roles' AND id=$1")
-            .bind(id)
-            .bind(&data)
-            .execute(&mut *connection)
-            .await
-            .map_err(ApiError::internal)?;
-    }
-    Ok(id)
+    data["default_permissions"] = defaults;
+    data["description"] = json!(ADMIN_DESCRIPTION);
 }
 
-/// Create the roles the app ships with ([`Registry::role`]) and keep their
-/// maps in step with the code while nobody has changed them. Each record keeps
-/// the defaults it was last given, which is how a change is recognised.
+/// Drop from every role what the app no longer has — a resource, an action, a
+/// field a field rule names — so the rest still applies and the role can be
+/// saved again from Roles.
+async fn prune_roles(
+    connection: &mut PgConnection,
+    targets: &crate::AccessTargets,
+    actions: &crate::ActionTargets,
+) -> Result<(), ApiError> {
+    let stored: Vec<(Uuid, Value)> =
+        sqlx::query_as("SELECT id,data->'permissions' FROM app_records WHERE kind='roles'")
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(ApiError::internal)?;
+    for (id, permissions) in stored {
+        let Some(map) = permissions.as_object() else {
+            continue;
+        };
+        let mut pruned = map.clone();
+        pruned.retain(|resource, _| targets.contains_key(resource));
+        for (resource, rules) in &mut pruned {
+            let Some(rules) = rules.as_object_mut() else {
+                continue;
+            };
+            rules.retain(|operation, _| {
+                crate::ACCESS_OPERATIONS.contains(&operation.as_str())
+                    || operation == crate::FIELD_RULES
+                    || actions
+                        .get(resource)
+                        .is_some_and(|names| names.contains(operation))
+            });
+            let fields = targets.get(resource).cloned().flatten();
+            if let Some(rules) = rules
+                .get_mut(crate::FIELD_RULES)
+                .and_then(Value::as_object_mut)
+            {
+                rules.retain(|field, _| fields.as_ref().is_some_and(|known| known.contains(field)));
+            }
+        }
+        if pruned != *map {
+            sqlx::query("UPDATE app_records SET data=jsonb_set(data,'{permissions}',$2),updated=now() WHERE kind='roles' AND id=$1")
+                .bind(id)
+                .bind(Value::Object(pruned))
+                .execute(&mut *connection)
+                .await
+                .map_err(ApiError::internal)?;
+        }
+    }
+    Ok(())
+}
+
+/// Create the roles the app ships and keep their maps in step with the code
+/// while nobody has changed them. They are ordinary role records: an
+/// administrator may change, rename or delete one, and that lasts. Each is
+/// created once (a deleted one stays deleted), found again by the name the code
+/// gives it (`shipped`) however it was renamed, and updated only while it
+/// still holds the defaults it was last given.
 ///
 /// # Errors
 /// Rejects maps that name unknown resources, fields, operations or actions.
@@ -535,43 +579,74 @@ pub async fn ensure_roles(
         targets.insert(kind.into(), None);
     }
     let actions = registry.action_targets();
-    for (name, permissions) in &registry.roles {
-        crate::parse_access_map_with_actions(permissions, &targets, &actions)
+    prune_roles(connection, &targets, &actions).await?;
+    for (name, permissions, description) in shipped_roles(registry) {
+        crate::parse_access_map_with_actions(&permissions, &targets, &actions)
             .map_err(|message| ApiError::Parse(format!("Role {name}: {message}")))?;
+        let key = name.to_lowercase();
         let existing: Option<(Uuid, Value)> = sqlx::query_as(
-            "SELECT id,data FROM app_records WHERE kind='roles' AND lower(data->>'name')=lower($1) ORDER BY created,id LIMIT 1",
+            "SELECT id,data FROM app_records WHERE kind='roles' AND (lower(data->>'shipped')=$1 OR (NOT data ? 'shipped' AND lower(data->>'name')=$1)) ORDER BY (data ? 'shipped') DESC,created,id LIMIT 1",
         )
-        .bind(name)
+        .bind(&key)
         .fetch_optional(&mut *connection)
         .await
         .map_err(ApiError::internal)?;
+        // Remembered apart from the role, so deleting the role is remembered too.
+        let created: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM app_records WHERE kind='shipped_roles' AND data->>'role'=$1)",
+        )
+        .bind(&key)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(ApiError::internal)?;
         match existing {
+            // An administrator deleted it.
+            None if created => continue,
             None => {
+                let mut data = json!({"name":name,"permissions":permissions,"default_permissions":permissions,"shipped":name});
+                if let Some(description) = description {
+                    data["description"] = json!(description);
+                }
                 sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'roles',$2)")
                     .bind(Uuid::new_v4())
-                    .bind(json!({"name":name,"permissions":permissions,"default_permissions":permissions}))
+                    .bind(&data)
                     .execute(&mut *connection)
                     .await
                     .map_err(ApiError::internal)?;
             }
-            Some((id, data))
-                if data.get("default_permissions") == data.get("permissions")
-                    && data.get("permissions") != Some(permissions) =>
-            {
-                let mut data = data;
-                data["permissions"] = permissions.clone();
-                data["default_permissions"] = permissions.clone();
-                sqlx::query(
-                    "UPDATE app_records SET data=$2,updated=now() WHERE kind='roles' AND id=$1",
-                )
-                .bind(id)
-                .bind(&data)
+            Some((id, data)) => {
+                let mut changed = data.clone();
+                if changed["managed"] == true {
+                    adopt_legacy_admin(&mut changed, registry);
+                }
+                if !changed["shipped"].is_string() {
+                    changed["shipped"] = json!(name);
+                }
+                if changed.get("default_permissions") == changed.get("permissions")
+                    && changed.get("permissions") != Some(&permissions)
+                {
+                    changed["permissions"] = permissions.clone();
+                    changed["default_permissions"] = permissions.clone();
+                }
+                if changed != data {
+                    sqlx::query(
+                        "UPDATE app_records SET data=$2,updated=now() WHERE kind='roles' AND id=$1",
+                    )
+                    .bind(id)
+                    .bind(&changed)
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(ApiError::internal)?;
+                }
+            }
+        }
+        if !created {
+            sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'shipped_roles',$2)")
+                .bind(Uuid::new_v4())
+                .bind(json!({"role":key}))
                 .execute(&mut *connection)
                 .await
                 .map_err(ApiError::internal)?;
-            }
-            // Changed by an administrator, made by hand, or already current.
-            Some(_) => {}
         }
     }
     Ok(())
@@ -599,8 +674,9 @@ pub(crate) async fn member(
     .map_err(ApiError::internal)
 }
 
-/// Give a signing-in superuser the Admin role, so the owner's own record shows
-/// and carries the access the platform already guarantees them.
+/// Give a signing-in superuser the app's Admin role when it has one, so the
+/// owner's own record shows it. Their access never depends on it: superusers
+/// pass every grant, row filter, action rule and field rule.
 pub(crate) async fn admit_superuser(
     app: &App,
     connection: &mut PgConnection,
@@ -610,7 +686,18 @@ pub(crate) async fn admit_superuser(
     if !app.superusers.contains(&email.trim().to_ascii_lowercase()) {
         return Ok(());
     }
-    let admin = ensure_admin_role(connection, &app.registry).await?;
+    // An app that never migrates (the shared core runtime) gets its shipped
+    // roles here, once, as migrating would give them.
+    ensure_roles(connection, &app.registry).await?;
+    let admin: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM app_records WHERE kind='roles' AND (lower(data->>'shipped')='admin' OR (NOT data ? 'shipped' AND lower(data->>'name')='admin')) ORDER BY (data ? 'shipped') DESC,created,id LIMIT 1",
+    )
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(admin) = admin else {
+        return Ok(());
+    };
     sqlx::query("UPDATE app_records SET data=jsonb_set(data,'{data,roles}',coalesce(data->'data'->'roles','[]'::jsonb)||to_jsonb($2::text)),updated=now() WHERE kind='users' AND id=$1 AND NOT coalesce(data->'data'->'roles','[]'::jsonb) ? $2::text")
         .bind(user)
         .bind(admin.to_string())

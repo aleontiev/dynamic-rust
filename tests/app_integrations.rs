@@ -1281,7 +1281,7 @@ async fn shipped_roles_are_checked_created_and_keep_an_administrators_changes() 
     let pool = isolated_pool("shipped_roles").await;
     let base = "http://127.0.0.1:9";
     let mut registry = registry(base);
-    for name in ["", "authenticated", "*", "admin", " ADMIN "] {
+    for name in ["", "authenticated", "*"] {
         assert!(registry.role(name, json!({})).is_err(), "{name:?}");
     }
     assert!(registry.role("Clerk", json!(["orders"])).is_err());
@@ -1407,6 +1407,102 @@ async fn shipped_roles_are_checked_created_and_keep_an_administrators_changes() 
         let error = next.migrate(&pool).await.unwrap_err();
         assert!(error.to_string().contains("Broken"), "{wrong} {error}");
     }
+
+    // Admin is an ordinary role the app ships by default: an administrator may
+    // rename it, and a release finds it again instead of adding another.
+    let id_of = |listed: &Value, name: &str| {
+        listed["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|role| role["name"] == name)
+            .map(|role| role["id"].as_str().unwrap().to_owned())
+    };
+    let (_, listed) = request(
+        &app,
+        "GET",
+        "/api/admin/roles/",
+        "dream_app=owner-token",
+        Value::Null,
+    )
+    .await;
+    let admin_id = id_of(&listed, "Admin").expect("the default Admin role");
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("/api/admin/roles/{admin_id}/"),
+        "dream_app=owner-token",
+        json!({"name":"Administrators"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let shipped = registry_with_roles(
+        base,
+        &[("Clerk", clerk.clone()), ("Auditor", auditor.clone())],
+    );
+    shipped.migrate(&pool).await.unwrap();
+    let saved = roles(pool.clone()).await;
+    assert!(
+        saved.contains_key("Administrators") && !saved.contains_key("Admin"),
+        "{saved:?}"
+    );
+    // A role an administrator deletes stays deleted, the default Admin included.
+    let (_, listed) = request(
+        &app,
+        "GET",
+        "/api/admin/roles/",
+        "dream_app=owner-token",
+        Value::Null,
+    )
+    .await;
+    for name in ["Administrators", "Auditor"] {
+        let id = id_of(&listed, name).unwrap();
+        let (status, _) = request(
+            &app,
+            "DELETE",
+            &format!("/api/admin/roles/{id}/"),
+            "dream_app=owner-token",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, 204, "{name}");
+    }
+    shipped.migrate(&pool).await.unwrap();
+    let saved = roles(pool.clone()).await;
+    assert_eq!(saved.keys().collect::<Vec<_>>(), vec!["Clerk"], "{saved:?}");
+    // The owners' access never depended on it.
+    for path in [
+        "/api/admin/roles/",
+        "/api/admin/users/",
+        "/api/admin/orders/",
+        "/api/admin/providers/",
+    ] {
+        let (status, _) = request(&app, "GET", path, "dream_app=owner-token", Value::Null).await;
+        assert_eq!(status, 200, "{path}");
+    }
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/admin/roles/",
+        "dream_app=owner-token",
+        json!({"name":"Admin","permissions":{"orders":{"list":true}}}),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "an administrator may make an Admin role of their own"
+    );
+
+    // An app may ship its own Admin instead of the default.
+    let fresh = isolated_pool("own_admin").await;
+    let own = registry_with_roles(
+        base,
+        &[("Admin", json!({"orders":{"list":true,"read":true}}))],
+    );
+    own.migrate(&fresh).await.unwrap();
+    let saved = roles(fresh.clone()).await;
+    assert_eq!(saved["Admin"], json!({"orders":{"list":true,"read":true}}));
+    assert_eq!(saved.len(), 1);
 }
 
 fn registry_with_roles(service: &str, roles: &[(&str, Value)]) -> Registry {

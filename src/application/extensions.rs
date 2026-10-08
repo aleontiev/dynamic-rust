@@ -458,6 +458,14 @@ pub struct Registry {
 /// visible when any of those roles may see it, and changeable when any may
 /// change it.
 fn apply_field_rules(declared: &Resource, resource: &mut Resource, actor: &Actor) {
+    // Superusers (the app's owners, and the platform acting for them) see and
+    // change every field the app lets anyone change, whatever roles say.
+    if actor.is_superuser {
+        for field in &mut resource.fields {
+            field.write_only = false;
+        }
+        return;
+    }
     if actor.fields.is_empty() {
         return;
     }
@@ -824,13 +832,14 @@ impl Registry {
     /// once an administrator changes it, their version stays.
     ///
     /// # Errors
-    /// Rejects empty, reserved (`*`, `authenticated`, `Admin`) or duplicate
-    /// names and maps that are not objects.
+    /// Rejects empty, reserved (`*`, `authenticated`) or duplicate names and
+    /// maps that are not objects. Shipping `Admin` replaces the default Admin
+    /// role's map.
     pub fn role(&mut self, name: &str, permissions: Value) -> Result<(), ApiError> {
         let trimmed = name.trim();
         if trimmed.is_empty()
             || trimmed.chars().count() > 100
-            || ["*", "authenticated", "admin"].contains(&trimmed.to_lowercase().as_str())
+            || ["*", "authenticated"].contains(&trimmed.to_lowercase().as_str())
             || self
                 .roles
                 .keys()
@@ -894,7 +903,6 @@ impl Registry {
             .execute(&mut *tx)
             .await
             .map_err(ApiError::internal)?;
-        super::core::ensure_admin_role(&mut tx, self).await?;
         super::integrations::sync_providers(&mut tx, self).await?;
         super::core::ensure_roles(&mut tx, self).await?;
         for (name, sql) in &self.migrations {

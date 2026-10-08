@@ -1672,8 +1672,9 @@ async fn legacy_admin_defaults_are_repaired_once_and_custom_permissions_are_pres
         .fetch_one(&f.pool)
         .await
         .unwrap();
-    assert_eq!(stored["admin_defaults_version"], 2);
-    assert_eq!(stored["managed"], true);
+    // It is now an ordinary role the app ships, no longer managed apart.
+    assert_eq!(stored["shipped"], "Admin");
+    assert!(stored.get("managed").is_none(), "{stored}");
     // A pre-upgrade role with customized grants is left intact, too.
     let custom = json!({"providers":{"list":true,"read":true,"create":true},"users":{"list":true}});
     sqlx::query("UPDATE app_records SET data=(data-'admin_defaults_version') || $2 WHERE id=$1")
@@ -1711,7 +1712,7 @@ async fn a_role_naming_what_the_app_dropped_keeps_the_rest_of_its_access() {
         .await
         .unwrap();
     // A release removed a resource and an action the stored Admin map still names.
-    sqlx::query("UPDATE app_records SET data=jsonb_set(jsonb_set(jsonb_set(data,'{permissions,ghosts}','{\"list\":true}'),'{permissions,roles,record_payment}','true'),'{admin_known}',data->'admin_known'||'[\"ghosts\",\"roles.record_payment\"]') WHERE id=$1::uuid")
+    sqlx::query("UPDATE app_records SET data=jsonb_set(jsonb_set(data,'{permissions,ghosts}','{\"list\":true}'),'{permissions,roles,record_payment}','true') WHERE id=$1::uuid")
         .bind(&role_id)
         .execute(&f.pool)
         .await
@@ -1721,7 +1722,8 @@ async fn a_role_naming_what_the_app_dropped_keeps_the_rest_of_its_access() {
         status, 200,
         "the rest of the Admin map still applies: {listed}"
     );
-    // The next time the Admin role is ensured, what's gone leaves its map.
+    // The next time roles are ensured, what's gone leaves the map, so the role
+    // can be saved again from Roles.
     owner_session(&f, secret).await;
     let data: Value = sqlx::query_scalar("SELECT data FROM app_records WHERE id=$1::uuid")
         .bind(&role_id)
@@ -1734,14 +1736,4 @@ async fn a_role_naming_what_the_app_dropped_keeps_the_rest_of_its_access() {
         "{data}"
     );
     assert_eq!(data["permissions"]["roles"]["list"], true);
-    let known: Vec<&str> = data["admin_known"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
-    assert!(
-        !known.contains(&"ghosts") && !known.contains(&"roles.record_payment"),
-        "{known:?}"
-    );
 }

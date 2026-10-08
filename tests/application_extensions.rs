@@ -1988,6 +1988,27 @@ async fn role_field_rules_reveal_and_open_fields_with_union_semantics() {
         .await
         .unwrap();
     assert_eq!(stored["name"], "Amina N.");
+
+    // The owners (and the platform acting for them) never depend on roles: a
+    // role that hides and locks fields does not narrow what a superuser sees
+    // or changes.
+    let hider = role(
+        "Hider",
+        json!({"staff":{"list":true,"read":true,"fields":{"salary":{"write_only":true},"name":{"read_only":true}}}}),
+    )
+    .await;
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("/api/admin/users/{}/", ids[0]),
+        owner,
+        json!({"roles":[hider]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let seen = request(&app, "GET", &path, owner, Value::Null).await.1;
+    assert_eq!(seen["staff_member"]["salary"], 900, "{seen}");
+    assert_eq!(patch(0, json!({"name":"Amina Owner-set"})).await.0, 200);
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)
         .await
