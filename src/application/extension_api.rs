@@ -36,6 +36,7 @@ pub(super) async fn list(
     );
     sideload(&mut ctx, &kind, &rows, &features, &mut document).await?;
     for row in &mut rows {
+        present(&app, &kind, row);
         project(row, &features);
     }
     document.resources.insert(kind, Value::Array(rows));
@@ -146,6 +147,7 @@ pub(super) async fn retrieve(
         &mut document,
     )
     .await?;
+    present(&app, &kind, &mut row);
     project(&mut row, &features);
     document
         .resources
@@ -266,10 +268,18 @@ async fn write(
         _ => return Err(ApiError::NotFound),
     };
     tx.commit().await.map_err(ApiError::internal)?;
+    let mut row = row;
+    present(&app, &kind, &mut row);
     Ok(Json(ApiDocument::one(
         &app.registry.models[&kind].resource.name,
         row,
     )))
+}
+/// Add what a record shows but does not store (a provider's redirect URI).
+fn present(app: &App, kind: &str, row: &mut Value) {
+    if kind == "providers" {
+        super::integrations::present(app, row);
+    }
 }
 pub(super) async fn create(
     State(app): State<App>,

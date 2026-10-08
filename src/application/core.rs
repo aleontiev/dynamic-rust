@@ -155,21 +155,6 @@ pub(super) async fn write(
                 .map_err(ApiError::internal)?;
             current
         }
-        ("providers", "create") => {
-            let id = super::integrations::create(connection, &input).await?;
-            fetch(connection, kind, id).await?
-        }
-        ("providers", "update") => {
-            let id = id.ok_or(ApiError::NotFound)?;
-            super::integrations::update(connection, id, &input).await?;
-            fetch(connection, kind, id).await?
-        }
-        ("providers", "delete") => {
-            let id = id.ok_or(ApiError::NotFound)?;
-            let current = raw(connection, kind, id).await?;
-            super::integrations::delete(connection, &current).await?;
-            public_record(kind, current)
-        }
         ("users", "delete") => {
             // Removing a person ends their sessions and sign-in identities; the
             // records they made stay. Nobody removes themselves.
@@ -188,6 +173,28 @@ pub(super) async fn write(
                 .execute(&mut *connection)
                 .await
                 .map_err(ApiError::internal)?;
+            // Their own connections to services go with them; the provider the
+            // code registers stops naming them.
+            for field in super::integrations::user_links(&app.registry) {
+                sqlx::query("DELETE FROM app_integration_secrets WHERE provider IN (SELECT (data->>'integration')||':'||id FROM app_records WHERE kind='providers' AND data->>$1=$2 AND data->>'primary'='false')")
+                    .bind(&field)
+                    .bind(id.to_string())
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(ApiError::internal)?;
+                sqlx::query("DELETE FROM app_records WHERE kind='providers' AND data->>$1=$2 AND data->>'primary'='false'")
+                    .bind(&field)
+                    .bind(id.to_string())
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(ApiError::internal)?;
+                sqlx::query("UPDATE app_records SET data=data-$1::text,updated=now() WHERE kind='providers' AND data->>$1=$2")
+                    .bind(&field)
+                    .bind(id.to_string())
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(ApiError::internal)?;
+            }
             sqlx::query("DELETE FROM app_records WHERE kind='users' AND id=$1")
                 .bind(id)
                 .execute(&mut *connection)
@@ -348,7 +355,7 @@ pub(crate) fn admin_access_map(registry: &super::extensions::Registry) -> Value 
         map.insert(
             kind.into(),
             match kind {
-                "roles" | "dashboards" | "views" | "users" | "providers" => all.clone(),
+                "roles" | "dashboards" | "views" | "users" => all.clone(),
                 _ => json!({"list":true,"read":true}),
             },
         );
@@ -369,6 +376,17 @@ pub(crate) fn admin_access_map(registry: &super::extensions::Registry) -> Value 
 /// Version 1 kept providers read-only and could not grant actions.
 const ADMIN_DEFAULTS_VERSION: i64 = 2;
 
+/// The built-in resources of version 1, when providers were one of them.
+const LEGACY_KINDS: [&str; 7] = [
+    "users",
+    "identities",
+    "identity_verifications",
+    "roles",
+    "dashboards",
+    "views",
+    "providers",
+];
+
 /// Whether an Admin role still holds the version 1 defaults, which the runtime
 /// rewrote on every start: roles, users, dashboards and views in full, the
 /// other built-ins read-only, and every model in full.
@@ -377,7 +395,7 @@ fn legacy_admin_map(permissions: &Value) -> bool {
     let Some(map) = permissions.as_object() else {
         return false;
     };
-    super::KINDS.iter().all(|kind| {
+    LEGACY_KINDS.iter().all(|kind| {
         map.get(*kind)
             == Some(
                 &if matches!(*kind, "roles" | "users" | "dashboards" | "views") {
@@ -388,7 +406,7 @@ fn legacy_admin_map(permissions: &Value) -> bool {
             )
     }) && map
         .iter()
-        .all(|(name, rules)| super::KINDS.contains(&name.as_str()) || rules == &all)
+        .all(|(name, rules)| LEGACY_KINDS.contains(&name.as_str()) || rules == &all)
 }
 
 /// What the Admin role is granted, one entry per resource and per action

@@ -622,6 +622,7 @@ async fn custom_models_actions_hooks_permissions_tasks_and_persistence() {
         roles: ["buyer".into()].into(),
         is_superuser: false,
         access: std::collections::BTreeMap::default(),
+        fields: std::collections::BTreeMap::default(),
     };
     let mut tx = pool.begin().await.unwrap();
     dynamic_rust::application::extensions::lock(&mut tx)
@@ -1763,6 +1764,230 @@ async fn stored_roles_grant_access_at_runtime_and_are_managed_through_the_api() 
     );
 
     pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+/// A role's field rules reveal hidden fields and open read-only ones for the
+/// people holding it, and across several roles a person gets the most any of
+/// them allows, as with operations.
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn role_field_rules_reveal_and_open_fields_with_union_semantics() {
+    let url = std::env::var("DREAM_TEST_DATABASE_URL").unwrap();
+    let admin = PgPool::connect(&url).await.unwrap();
+    let schema = format!("fields_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let search = schema.clone();
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .after_connect(move |conn, _| {
+            let query = format!("SET search_path TO {search}");
+            Box::pin(async move {
+                sqlx::query(&query).execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut registry = Registry::default();
+    registry
+        .model(
+            Model::new("staff", "staff_member")
+                .field("name", FieldKind::String)
+                .required("name")
+                .field("salary", FieldKind::Integer)
+                .write_only("salary")
+                .label("salary", "Monthly salary")
+                .field("grade", FieldKind::String)
+                .readonly("grade")
+                .grant("hr", &["list", "read", "create", "update", "delete"]),
+        )
+        .unwrap();
+    registry.migrate(&pool).await.unwrap();
+    let mut cookies = vec![];
+    let mut ids = vec![];
+    for name in ["owner", "viewer", "payroll", "clerk", "both"] {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'users',$2)")
+            .bind(id)
+            .bind(json!({"name":name,"email":format!("{name}@example.com"),"data":{"roles":[]}}))
+            .execute(&pool)
+            .await
+            .unwrap();
+        use sha2::{Digest, Sha256};
+        let token = format!("{name}-token");
+        let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+        sqlx::query("INSERT INTO app_sessions(digest,user_id,expires) VALUES($1,$2,now()+interval '1 hour')").bind(digest).bind(id).execute(&pool).await.unwrap();
+        cookies.push(format!("dream_app={token}"));
+        ids.push(id);
+    }
+    let member = Uuid::new_v4();
+    sqlx::query("INSERT INTO app_records(id,kind,data) VALUES($1,'staff',$2)")
+        .bind(member)
+        .bind(json!({"name":"Amina","salary":900,"grade":"B"}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = router(App {
+        pool: pool.clone(),
+        registry: Arc::new(registry),
+        name: "People".into(),
+        origin: "https://example.com".into(),
+        preview_origins: vec![],
+        mail_from: "noreply@example.com".into(),
+        mail_region: "us-east-1".into(),
+        mail_api_key: None,
+        google_auth: None,
+        branding: json!({}),
+        mail_endpoint: None,
+        revision: "test".into(),
+        superusers: dynamic_rust::application::parse_superusers("owner@example.com"),
+        operator_secret: None,
+    });
+    let owner = cookies[0].as_str();
+
+    // The editor learns each resource's fields and what the app declares.
+    let (_, meta) = request(&app, "OPTIONS", "/api/admin/roles/", owner, Value::Null).await;
+    let fields = &meta["fields"]["permissions"]["resources"]["staff"]["fields"];
+    assert_eq!(
+        fields["salary"],
+        json!({"label":"Monthly salary","read_only":false,"write_only":true})
+    );
+    assert_eq!(fields["grade"]["read_only"], true);
+
+    // Field rules are validated when a role is saved.
+    for (rules, message) in [
+        (
+            json!({"staff":{"fields":{"wage":{"write_only":false}}}}),
+            "unknown field wage",
+        ),
+        (
+            json!({"staff":{"fields":{"salary":{"visible":true}}}}),
+            "unknown flag visible",
+        ),
+        (
+            json!({"staff":{"fields":{"salary":{"write_only":"no"}}}}),
+            "must be true or false",
+        ),
+        (
+            json!({"users":{"fields":{"email":{"write_only":true}}}}),
+            "the app's own resources",
+        ),
+    ] {
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/api/admin/roles/",
+            owner,
+            json!({"name":"Bad","permissions":rules}),
+        )
+        .await;
+        assert_eq!(status, 400, "{rules}");
+        assert!(body.to_string().contains(message), "{body}");
+    }
+    let role = |name: &'static str, permissions: Value| {
+        let app = app.clone();
+        async move {
+            let (status, body) = request(
+                &app,
+                "POST",
+                "/api/admin/roles/",
+                "dream_app=owner-token",
+                json!({"name":name,"permissions":permissions}),
+            )
+            .await;
+            assert_eq!(status, 201, "{body}");
+            body["role"]["id"].as_str().unwrap().to_owned()
+        }
+    };
+    let viewer = role("Viewer", json!({"staff":{"list":true,"read":true}})).await;
+    let payroll = role(
+        "Payroll",
+        json!({"staff":{"list":true,"read":true,"update":true,"fields":{"salary":{"write_only":false},"grade":{"read_only":false}}}}),
+    )
+    .await;
+    let clerk = role(
+        "Clerk",
+        json!({"staff":{"list":true,"read":true,"update":true,"fields":{"name":{"read_only":true}}}}),
+    )
+    .await;
+    for (index, held) in [
+        (1, vec![viewer.clone()]),
+        (2, vec![payroll.clone()]),
+        (3, vec![clerk.clone()]),
+        (4, vec![clerk.clone(), payroll.clone()]),
+    ] {
+        let (status, body) = request(
+            &app,
+            "PATCH",
+            &format!("/api/admin/users/{}/", ids[index]),
+            owner,
+            json!({"roles":held}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let path = format!("/api/admin/staff/{member}/");
+    let read = |index: usize| {
+        let app = app.clone();
+        let cookie = cookies[index].clone();
+        let path = path.clone();
+        async move { request(&app, "GET", &path, &cookie, Value::Null).await.1 }
+    };
+
+    // Hidden stays hidden for a role that says nothing; a rule reveals it.
+    assert!(read(1).await["staff_member"].get("salary").is_none());
+    assert_eq!(read(2).await["staff_member"]["salary"], 900);
+    let (_, meta) = request(
+        &app,
+        "OPTIONS",
+        "/api/admin/staff/",
+        &cookies[1],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(meta["fields"]["salary"]["hidden"], true);
+    let (_, meta) = request(
+        &app,
+        "OPTIONS",
+        "/api/admin/staff/",
+        &cookies[2],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(meta["fields"]["salary"]["hidden"], false);
+    assert_eq!(meta["fields"]["grade"]["read_only"], false);
+
+    // A rule opens a read-only field for changes, or closes a writable one.
+    let patch = |index: usize, body: Value| {
+        let app = app.clone();
+        let cookie = cookies[index].clone();
+        let path = path.clone();
+        async move { request(&app, "PATCH", &path, &cookie, body).await }
+    };
+    assert_eq!(patch(2, json!({"grade":"A"})).await.0, 200);
+    assert_eq!(patch(3, json!({"grade":"C"})).await.0, 400);
+    assert_eq!(patch(3, json!({"name":"Amina K."})).await.0, 400);
+    assert_eq!(patch(2, json!({"name":"Amina K."})).await.0, 200);
+
+    // Holding both, a person gets the most either allows.
+    let (status, body) = patch(4, json!({"name":"Amina N.","grade":"A+"})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(read(4).await["staff_member"]["salary"], 900);
+    assert_eq!(read(4).await["staff_member"]["grade"], "A+");
+    let stored: Value = sqlx::query_scalar("SELECT data FROM app_records WHERE id=$1")
+        .bind(member)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored["name"], "Amina N.");
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)
         .await

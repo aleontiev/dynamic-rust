@@ -29,6 +29,10 @@ pub struct Actor {
     /// The access maps of the roles this user holds, keyed by role name. They
     /// are merged with the grants the code declares when a resource is resolved.
     pub access: BTreeMap<String, AccessMap>,
+    /// What the roles this user holds say about resources' fields, keyed by
+    /// role name: which declared read-only fields they may change and which
+    /// hidden ones they may see.
+    pub fields: BTreeMap<String, crate::FieldAccess>,
 }
 impl Actor {
     /// The actor for a user record before its stored roles are resolved: the
@@ -44,6 +48,7 @@ impl Actor {
             roles,
             is_superuser: false,
             access: BTreeMap::new(),
+            fields: BTreeMap::new(),
         }
     }
     /// The record ids among a user's stored roles.
@@ -58,6 +63,12 @@ impl Actor {
     pub fn hold(&mut self, name: &str, access: AccessMap) {
         self.roles.insert(name.into());
         self.access.insert(name.into(), access);
+    }
+    /// Record what a held role says about resources' fields.
+    pub fn hold_fields(&mut self, name: &str, fields: crate::FieldAccess) {
+        if !fields.is_empty() {
+            self.fields.insert(name.into(), fields);
+        }
     }
     /// Whether this person is a member of the app: a superuser, or someone
     /// holding at least one role. Only members carry the implicit
@@ -101,6 +112,7 @@ impl Actor {
             roles: BTreeSet::from(["authenticated".to_owned()]),
             is_superuser: true,
             access: BTreeMap::new(),
+            fields: BTreeMap::new(),
         }
     }
     /// The actor for a user, marked as a superuser when that user's verified
@@ -301,6 +313,15 @@ impl Model {
         }
         self
     }
+    /// A field people may set but not see (a salary, a private note): it is
+    /// left out of what the API returns, unless a role's field rules reveal
+    /// it (`"fields": {"salary": {"write_only": false}}`).
+    pub fn write_only(mut self, name: &str) -> Self {
+        if let Some(f) = self.resource.fields.iter_mut().find(|f| f.name == name) {
+            f.write_only = true;
+        }
+        self
+    }
     pub fn relation(mut self, name: &str, target: &str) -> Self {
         self = self.field(name, FieldKind::Relation);
         if let Some(field) = self.resource.fields.last_mut() {
@@ -367,6 +388,29 @@ impl Model {
         self.resource.metadata = Some(metadata);
         self
     }
+    /// Extra admin metadata for one field, merged into how the admin describes
+    /// it: `{"secret": true}` for a value typed but never shown again,
+    /// `{"depends": {"kind": "oauth2"}}` to show it only when another field
+    /// matches, `{"choices": [...]}`, `{"hide": true}`.
+    pub fn field_metadata(mut self, name: &str, extra: Value) -> Self {
+        let mut metadata = self
+            .resource
+            .metadata
+            .clone()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let fields = metadata
+            .entry("field_metadata")
+            .or_insert_with(|| json!({}));
+        if let (Some(fields), Value::Object(extra)) = (fields.as_object_mut(), extra) {
+            let entry = fields.entry(name).or_insert_with(|| json!({}));
+            if let Some(entry) = entry.as_object_mut() {
+                entry.extend(extra);
+            }
+        }
+        self.resource.metadata = Some(Value::Object(metadata));
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -390,8 +434,11 @@ pub struct ActionDetails {
     pub when: Map<String, Value>,
     /// Inputs the admin asks for before running the action, by name.
     pub parameters: Map<String, Value>,
+    /// The action answers `{"redirect": url}` and the browser goes there (to
+    /// sign in to an outside service, say).
+    pub navigate: bool,
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Registry {
     pub models: BTreeMap<String, Model>,
     pub actions: BTreeMap<(String, String), Action>,
@@ -404,7 +451,126 @@ pub struct Registry {
     /// Outside services the app connects to, by name; each is a `providers` record.
     pub integrations: BTreeMap<String, Integration>,
 }
+/// Resolve which fields a person may see and change from what their roles say
+/// about them. Each role reaching the resource (a grant in code, or a stored
+/// map naming it) sees a field as its field rules say, or as the app declares
+/// it; the person gets the most a role allows, as with operations: a field is
+/// visible when any of those roles may see it, and changeable when any may
+/// change it.
+fn apply_field_rules(declared: &Resource, resource: &mut Resource, actor: &Actor) {
+    if actor.fields.is_empty() {
+        return;
+    }
+    let kind = declared.plural_name.as_str();
+    let mut views: Vec<Option<&crate::FieldRules>> = vec![];
+    // A role the code grants operations to sees the fields as declared.
+    if actor
+        .roles
+        .iter()
+        .map(String::as_str)
+        .chain(["*"])
+        .any(|role| {
+            declared
+                .role_grants
+                .get(role)
+                .is_some_and(|operations| !operations.is_empty())
+        })
+    {
+        views.push(None);
+    }
+    for role in &actor.roles {
+        let rules = actor.fields.get(role).and_then(|fields| fields.get(kind));
+        let reaches = actor
+            .access
+            .get(role)
+            .is_some_and(|access| access.contains_key(kind));
+        if rules.is_some() || reaches {
+            views.push(rules);
+        }
+    }
+    if views.iter().all(Option::is_none) {
+        return;
+    }
+    for field in &mut resource.fields {
+        let flag = |name: &str, declared: bool| {
+            views.iter().all(|view| {
+                view.and_then(|rules| rules.get(&field.name))
+                    .and_then(|flags| flags.get(name).copied())
+                    .unwrap_or(declared)
+            })
+        };
+        let (read_only, write_only) = (
+            flag("read_only", field.read_only),
+            flag("write_only", field.write_only),
+        );
+        field.read_only = read_only;
+        field.write_only = write_only;
+    }
+}
+/// Every registry starts with the built-in providers model and its actions.
+impl Default for Registry {
+    fn default() -> Self {
+        let mut registry = Self {
+            models: BTreeMap::new(),
+            actions: BTreeMap::new(),
+            tasks: BTreeMap::new(),
+            migrations: BTreeMap::new(),
+            roles: BTreeMap::new(),
+            schedules: BTreeMap::new(),
+            integrations: BTreeMap::new(),
+        };
+        super::integrations::register(&mut registry);
+        registry
+    }
+}
 impl Registry {
+    /// Change a registered model, the built-in `providers` included: add a
+    /// field, a label, a grant. Say, to connect each entity to a service on
+    /// its own (see [`Integration::per`]):
+    ///
+    /// ```ignore
+    /// registry.extend("providers", |providers| {
+    ///     providers
+    ///         .relation("entity", "entities")
+    ///         .label("entity", "Entity")
+    ///         .describe("entity", "The entity whose books this connection reaches.")
+    /// })?;
+    /// ```
+    ///
+    /// # Errors
+    /// Rejects an unknown model, and changes that leave invalid or duplicate
+    /// fields; the model is then left as it was.
+    pub fn extend(
+        &mut self,
+        name: &str,
+        change: impl FnOnce(Model) -> Model,
+    ) -> Result<(), ApiError> {
+        let model = self
+            .models
+            .remove(name)
+            .ok_or_else(|| ApiError::Parse(format!("Unknown model: {name}")))?;
+        let changed = change(model.clone());
+        if changed.resource.plural_name != name {
+            self.models.insert(name.into(), model);
+            return Err(ApiError::Parse(format!(
+                "Extending {name} cannot rename it"
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        if changed
+            .resource
+            .fields
+            .iter()
+            .any(|field| !identifier(&field.name) || !seen.insert(field.name.clone()))
+        {
+            self.models.insert(name.into(), model);
+            return Err(ApiError::Parse(format!(
+                "Invalid or duplicate field on {name}"
+            )));
+        }
+        self.models.insert(name.into(), changed);
+        Ok(())
+    }
     /// A model's resource with the actor's stored roles merged into its grants.
     #[must_use]
     pub fn resource_for(&self, kind: &str, actor: &Actor) -> Option<Resource> {
@@ -421,6 +587,7 @@ impl Registry {
                 crate::grant_access(&mut resource, role, &operations);
             }
         }
+        apply_field_rules(&model.resource, &mut resource, actor);
         Some(resource)
     }
     /// The actions an access map may grant: every registered action, by model.
@@ -570,6 +737,11 @@ impl Registry {
                 "icon" => parsed.icon = Some(text()?),
                 "description" => parsed.description = Some(text()?),
                 "confirm" => parsed.confirm = Some(text()?),
+                "navigate" => {
+                    parsed.navigate = value
+                        .as_bool()
+                        .ok_or_else(|| invalid("navigate must be true or false"))?;
+                }
                 "when" => {
                     let Value::Object(lookups) = value else {
                         return Err(invalid("when must be an object of lookups"));
@@ -723,7 +895,7 @@ impl Registry {
             .await
             .map_err(ApiError::internal)?;
         super::core::ensure_admin_role(&mut tx, self).await?;
-        super::integrations::sync_providers(&mut tx, &self.integrations).await?;
+        super::integrations::sync_providers(&mut tx, self).await?;
         super::core::ensure_roles(&mut tx, self).await?;
         for (name, sql) in &self.migrations {
             let digest = super::hash(sql);
@@ -859,14 +1031,51 @@ impl<'a> Context<'a> {
     }
     /// The connection to a registered integration, with a current access
     /// token (refreshed if it was about to expire). Use it for calls to the
-    /// service: `context.integration("quickbooks").await?.get(url).send().await`.
+    /// service: `context.integration("books").await?.get(url).send().await`.
     ///
     /// # Errors
     /// Answers 409 when the service is not connected, is turned off, or its
     /// tokens can no longer be refreshed (the provider record then shows why).
     pub async fn integration(&mut self, name: &str) -> Result<Connection, ApiError> {
         let pool = self.pool.clone();
-        super::integrations::connect(self, pool.as_ref(), name).await
+        super::integrations::connect(self, pool.as_ref(), name, super::integrations::Serving::App)
+            .await
+    }
+    /// The connection to an integration registered with
+    /// [`Integration::per`] that serves `record`, the id its providers name in
+    /// that field (an entity's own books, or a person's own account), with a
+    /// current access token. A record has no connection until someone allowed
+    /// to adds and connects one under Providers, or code adds one with
+    /// [`Self::add_connection`].
+    ///
+    /// # Errors
+    /// Answers 409 when the record has no connection, it is not connected, is
+    /// turned off, or its tokens can no longer be refreshed; rejects an
+    /// integration that serves the whole app.
+    pub async fn integration_for(
+        &mut self,
+        name: &str,
+        record: Uuid,
+    ) -> Result<Connection, ApiError> {
+        let pool = self.pool.clone();
+        super::integrations::connect(
+            self,
+            pool.as_ref(),
+            name,
+            super::integrations::Serving::Record(record),
+        )
+        .await
+    }
+    /// The provider serving `record` for an integration registered with
+    /// [`Integration::per`], adding one that waits to be connected when there
+    /// is none (say from a hook when an entity is created, so its
+    /// administrators only press Connect). Returns the provider's id.
+    ///
+    /// # Errors
+    /// Rejects an unknown integration, one that serves the whole app, or a
+    /// record that does not exist; returns database errors.
+    pub async fn add_connection(&mut self, name: &str, record: Uuid) -> Result<Uuid, ApiError> {
+        super::integrations::ensure(self, name, record).await
     }
     /// Bring in one record from an outside service: update the `kind` record
     /// whose `external_id` is `external_id` with `input`, or create it, as the
@@ -1154,7 +1363,7 @@ impl<'a> Context<'a> {
 }
 /// A record as people see it: every readable field, `null` where it holds no
 /// value, so clients can tell an empty field from one they have not loaded.
-fn output(resource: &Resource, mut value: Value) -> Value {
+pub(super) fn output(resource: &Resource, mut value: Value) -> Value {
     let object = value.as_object_mut().unwrap();
     object.retain(|name, _| resource.field(name).is_some_and(|f| !f.write_only));
     for field in &resource.fields {
@@ -1550,8 +1759,25 @@ pub fn metadata(model: &Model, actor: &Actor, registry: &Registry) -> Value {
         .collect();
     let mut value = json!({"type":"resource","name":resource.plural_name,"singular":resource.name,"singular_name":resource.name,"label":crate::python_title(&resource.plural_name.replace('_'," ")),"icon":"table","url":format!("/api/admin/{}/",resource.plural_name),"id_field":"id","name_field":"name","section":"App","fields":fields,"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":names}],"list_fields":resource.list_fields});
     if let Some(extra) = resource.metadata.as_ref().and_then(Value::as_object) {
+        for (name, field) in extra
+            .get("field_metadata")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(target), Some(field)) =
+                (value["fields"][name].as_object_mut(), field.as_object())
+            {
+                target.extend(field.clone());
+            }
+        }
         if let Some(object) = value.as_object_mut() {
-            object.extend(extra.clone());
+            object.extend(
+                extra
+                    .iter()
+                    .filter(|(key, _)| *key != "field_metadata")
+                    .map(|(key, field)| (key.clone(), field.clone())),
+            );
         }
     }
     let effective = crate::resource_metadata(resource, Some(actor.principal()));
@@ -1578,6 +1804,9 @@ impl ActionDetails {
             .clone()
             .unwrap_or_else(|| crate::python_title(&name.replace('_', " ")));
         let mut value = json!({"name":name,"label":label,"method":"post","methods":["POST"],"detail":true,"url":format!("/api/admin/{kind}/:id/actions/{name}/")});
+        if self.navigate {
+            value["navigate"] = json!(true);
+        }
         for (key, detail) in [
             ("icon", &self.icon),
             ("description", &self.description),

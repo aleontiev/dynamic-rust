@@ -79,7 +79,25 @@ conditions are OR-ed with each other and with the code's row filters. A model
 that declares no grants is open to every signed-in user, so rules for it change
 nothing. Built-in resources take only `true` or `false`. Maps are validated when
 saved; `OPTIONS /api/admin/roles/` lists the resources rules may name under the
-`permissions` field, marking which accept conditions.
+`permissions` field, marking which accept conditions, with each model's fields
+and what the app declares about them.
+
+Next to its operations, a role's rules for a model may say who sees and changes
+which fields, as Dynamic REST serializers do: `read_only: false` lets the role
+change a field the app declares read-only, `write_only: false` lets it see one
+the app hides (`.write_only("salary")`), and `true` takes either away:
+
+```json
+{"staff": {"list": true, "read": true, "update": true,
+           "fields": {"salary": {"write_only": false},
+                      "grade": {"read_only": false},
+                      "name": {"read_only": true}}}}
+```
+
+Across the roles a person holds that reach the model, a field is visible when
+any of them may see it and changeable when any may change it — union
+semantics, as with operations. Hidden fields are left out of what the API
+returns and marked `hidden` in metadata; a read-only one is refused in writes.
 
 An app ships its own roles with `registry.role(name, map)`:
 
@@ -103,12 +121,11 @@ Superusers, and holders of a role whose map grants those operations on `roles`
 and `users`, create, edit and delete roles, add and remove users (removing
 one ends their sessions and sign-in identities; nobody removes themselves), and
 set the `roles` (and `name`) of users; deleting a role removes it from every user. `dashboards` and `views`
-(the admin's saved pages) are written the same way. So are `providers`: a
-role granting their operations adds one by hand with a `name`, a `kind` and
-`enabled`, edits and removes it; anything else stored on the record stays
-private and unchanged. Providers the app's code registers (see
-[Calling outside services](#calling-outside-services)) can be renamed but keep
-their kind and cannot be removed. Everything else built in remains read-only. Role names must be unique; `*` and `authenticated` are
+(the admin's saved pages) are written the same way. `providers` is a built-in
+*model* rather than one of these (see
+[Calling outside services](#calling-outside-services)): roles grant its
+operations, actions and fields like any model's. Everything else built in
+remains read-only. Role names must be unique; `*` and `authenticated` are
 reserved. Role entries on a user that are not record ids are still treated as
 role names, so applications that assigned roles by name keep working.
 
@@ -294,34 +311,39 @@ the host's timeout — and queue a task for them instead.
 no dependency to add. Use it from tasks.
 
 Every outside service the app talks to is registered as an **integration**,
-whichever way it lets the app in. Services that sign in with OAuth 2 (QuickBooks
-Online, Xero, Uber, Google, Slack, ...) use `Integration::oauth2`:
+whichever way it lets the app in. Services that sign in with OAuth 2 (most
+accounting, payments, mail and workspace services) use `Integration::oauth2`:
 
 ```rust
 use dynamic_rust::application::extensions::Integration;
 
 registry.integration(
-    Integration::oauth2("quickbooks", "QuickBooks Online")
-        .describe("Two-way sync of vendors, accounts, purchase orders and bills.")
-        .authorize_url("https://appcenter.intuit.com/connect/oauth2")
-        .token_url("https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer")
-        .scopes(&["com.intuit.quickbooks.accounting"])
-        .account_params(&["realmId"]),
+    Integration::oauth2("books", "Books Online")
+        .describe("Two-way sync of vendors, accounts and bills.")
+        .authorize_url("https://accounts.books.example/oauth2/authorize")
+        .token_url("https://accounts.books.example/oauth2/token")
+        .scopes(&["accounting"])
+        .account_params(&["companyId"]),
 )?;
 ```
 
-Each registered integration is a record in the built-in `providers` resource
-(`registry.migrate` adds it). An administrator — a superuser, or anyone whose
-role grants `providers` `update` — opens it, enters the **client ID** and
-**client secret** from the service's developer console, registers the record's
-**redirect URI** (`https://<app>/api/integrations/<name>/callback`) there, and
-presses **Connect**. After the service's consent page the record shows
-`status` `connected`, when, and the `account` the service identified (the
-callback parameters named in `account_params`, e.g. QuickBooks' `realmId`).
-**Disconnect** drops the tokens. Changing the client ID or secret clears the
-connection. Roles that grant only `providers` `list`/`read` see the status but
-neither the buttons nor the credentials; nobody sees the secret or the tokens,
-which live in a table no API returns. `.authorize_param(k, v)` adds query
+Each registered integration is a record of the built-in `providers` model
+(`registry.migrate` adds it, flagged `primary`). Providers are an ordinary
+model: the API, filters, metadata and role rules work as for any other, roles
+grant its `connect` and `disconnect` actions, and its field rules can hide or
+open its fields to a role. Someone whose roles grant `providers` `update`
+opens the record, enters the **client ID** and **client secret** from the
+service's developer console, registers the record's **redirect URI**
+(`https://<app>/api/integrations/<name>/callback`) there, and — holding
+`connect` — presses **Connect**. After the service's consent page the record
+shows `status` `connected`, when, and the `account` the service identified (the
+callback parameters named in `account_params`). **Disconnect** drops the
+tokens. Changing the client ID or secret clears the connection. The fields the
+service owns (status, account, redirect URI, ...) are read-only; nobody sees
+the secret or the tokens, which live in a table no API returns — the record
+shows `Saved` in their place. Administrators may also add providers by hand (a
+`name`, a `kind` and `enabled`) for the app's code to read; the ones the code
+registers can be renamed but keep their kind and cannot be removed. `.authorize_param(k, v)` adds query
 parameters to the consent page (Google's `access_type=offline`), and
 `.client_secret_in_body()` sends the credentials as form fields for services
 that refuse HTTP Basic.
@@ -354,10 +376,10 @@ asks for Connect again.
 Code uses the connection from a task:
 
 ```rust
-let books = context.integration("quickbooks").await?;
-let realm = books.account["realmId"].as_str().unwrap_or_default();
+let books = context.integration("books").await?;
+let company = books.account["companyId"].as_str().unwrap_or_default();
 let vendor: Value = books
-    .get(&format!("https://quickbooks.api.intuit.com/v3/company/{realm}/vendor/58"))
+    .get(&format!("/v1/companies/{company}/vendors/58"))
     .header("accept", "application/json")
     .send().await.map_err(ApiError::internal)?
     .json().await.map_err(ApiError::internal)?;
@@ -376,6 +398,53 @@ A connection's `base_url` is the record's Base URL or the integration's
 default, and a path starting with `/` is requested under it, with the
 credentials: `ledger.get("/v0/collections/?page=1")`, `ledger.post(...)`,
 `.put`, `.patch` and `.delete`.
+
+### One connection per record
+
+An integration serves the whole app unless it says otherwise. To connect each
+record of something on its own — each company or entity to its own books, each
+person to their own account — add a relation to the providers model with
+`registry.extend` and name it with `.per`:
+
+```rust
+registry.extend("providers", |providers| {
+    providers
+        .relation("entity", "entities")
+        .label("entity", "Entity")
+        .describe("entity", "The entity whose books this connection reaches.")
+})?;
+registry.integration(Integration::oauth2("books", "Books Online") /* ... */.per("entity"))?;
+
+// In a task: the books of this entity, and no other's.
+let books = context.integration_for("books", entity_id).await?;
+```
+
+Each record's connection is a `providers` record naming it in that field, added
+under Providers (choose the service and the record) or by code with
+`context.add_connection("books", entity_id)` — say from a hook when an entity is
+created — which returns the existing one if there is one. A record has at most
+one connection per service. OAuth connections sign in with the client ID and
+secret saved on the service's `primary` provider, so each only needs
+**Connect**; a token connection takes its own token, and its Base URL falls
+back to the primary provider's. The primary provider may itself name a record.
+`integration_for` answers 409 when the record has no connection or it is not
+connected, never falling back to another record's. A record with a connection
+cannot be deleted until the connection is, and deleting a connection deletes
+its tokens.
+
+For a person's own account, relate providers to `users` and let roles reach
+only their own, with ordinary conditions:
+
+```json
+{"providers": {"list": {"user": "$user.id"}, "read": {"user": "$user.id"},
+               "create": {"user": "$user.id"}, "update": {"user": "$user.id"},
+               "connect": {"user": "$user.id"}, "disconnect": {"user": "$user.id"},
+               "fields": {"base_url": {"write_only": true}}}}
+```
+
+Someone adding a connection to such a service who names nobody serves
+themselves; code reaches it with `context.integration_for("ledger", user_id)`.
+Removing a person removes their connections and tokens.
 
 ### Keeping records in step
 

@@ -127,6 +127,105 @@ pub type AccessTargets = BTreeMap<String, Option<BTreeSet<String>>>;
 /// action is `true` (on every record) or a condition the record must meet.
 pub type ActionTargets = BTreeMap<String, BTreeSet<String>>;
 
+/// What a role says about one resource's fields, next to its operations, as
+/// Dynamic REST serializers do (`"fields": {"notes": {"write_only": false}}`):
+/// per field, `read_only: false` lets the role change a field the app declares
+/// read-only and `write_only: false` lets it see a field the app hides, while
+/// `true` takes either away.
+pub type FieldRules = BTreeMap<String, BTreeMap<String, bool>>;
+
+/// Field rules keyed by resource name.
+pub type FieldAccess = BTreeMap<String, FieldRules>;
+
+/// The field flags a role may override.
+pub const FIELD_FLAGS: [&str; 2] = ["read_only", "write_only"];
+
+/// The key of a resource's rules that holds its field rules.
+pub const FIELD_RULES: &str = "fields";
+
+/// Parse one resource's field rules, rejecting fields it does not have and
+/// flags other than [`FIELD_FLAGS`].
+fn parse_field_rules(
+    resource: &str,
+    value: &Value,
+    fields: Option<&BTreeSet<String>>,
+) -> Result<FieldRules, String> {
+    let Some(fields) = fields else {
+        return Err(format!(
+            "{resource}: field rules apply to the app's own resources."
+        ));
+    };
+    let Some(rules) = value.as_object() else {
+        return Err(format!(
+            "{resource}.fields: must be an object keyed by field."
+        ));
+    };
+    let mut parsed = FieldRules::new();
+    for (field, flags) in rules {
+        if !fields.contains(field) {
+            return Err(format!("{resource}.fields: unknown field {field}"));
+        }
+        let Some(flags) = flags.as_object() else {
+            return Err(format!(
+                "{resource}.fields.{field}: must be an object of read_only and write_only."
+            ));
+        };
+        let mut set = BTreeMap::new();
+        for (flag, value) in flags {
+            if !FIELD_FLAGS.contains(&flag.as_str()) {
+                return Err(format!("{resource}.fields.{field}: unknown flag {flag}"));
+            }
+            match value {
+                Value::Bool(value) => {
+                    set.insert(flag.clone(), *value);
+                }
+                Value::Null => {}
+                _ => {
+                    return Err(format!(
+                        "{resource}.fields.{field}.{flag}: must be true or false."
+                    ));
+                }
+            }
+        }
+        if !set.is_empty() {
+            parsed.insert(field.clone(), set);
+        }
+    }
+    Ok(parsed)
+}
+
+/// Read the field rules of a stored access map. A resource, field or flag the
+/// app no longer has is skipped; everything else still applies.
+#[must_use]
+pub fn parse_stored_field_access(value: &Value, targets: &AccessTargets) -> FieldAccess {
+    let mut access = FieldAccess::new();
+    for (resource, rules) in value.as_object().into_iter().flatten() {
+        let Some(Some(fields)) = targets.get(resource) else {
+            continue;
+        };
+        let Some(rules) = rules.get(FIELD_RULES).and_then(Value::as_object) else {
+            continue;
+        };
+        let parsed: FieldRules = rules
+            .iter()
+            .filter(|(field, _)| fields.contains(*field))
+            .filter_map(|(field, flags)| {
+                let flags: BTreeMap<String, bool> = flags
+                    .as_object()?
+                    .iter()
+                    .filter(|(flag, _)| FIELD_FLAGS.contains(&flag.as_str()))
+                    .filter_map(|(flag, value)| Some((flag.clone(), value.as_bool()?)))
+                    .collect();
+                (!flags.is_empty()).then(|| (field.clone(), flags))
+            })
+            .collect();
+        if !parsed.is_empty() {
+            access.insert(resource.clone(), parsed);
+        }
+    }
+    access
+}
+
 /// Parse and validate an access map against the resources it may name.
 ///
 /// # Errors
@@ -160,6 +259,10 @@ pub fn parse_access_map_with_actions(
         };
         let mut parsed = AccessRules::new();
         for (operation, rule) in rules {
+            if operation == FIELD_RULES {
+                parse_field_rules(resource, rule, fields.as_ref())?;
+                continue;
+            }
             if !OPERATIONS.contains(&operation.as_str())
                 && !actions
                     .get(resource)

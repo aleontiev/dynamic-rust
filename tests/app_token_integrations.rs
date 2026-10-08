@@ -324,8 +324,15 @@ async fn token_providers_connect_by_checking_the_token_and_syncs_keep_outside_id
     let fields = &meta["fields"];
     assert_eq!(fields["token"]["secret"], true);
     assert_eq!(fields["token"]["depends"], json!({"kind":"token"}));
-    assert_eq!(fields["client_id"]["depends"], json!({"kind":"oauth2"}));
-    assert_eq!(fields["redirect_uri"]["depends"], json!({"kind":"oauth2"}));
+    // Only the provider the code registers holds an OAuth client.
+    assert_eq!(
+        fields["client_id"]["depends"],
+        json!({"kind":"oauth2","primary":true})
+    );
+    assert_eq!(
+        fields["redirect_uri"]["depends"],
+        json!({"kind":"oauth2","primary":true})
+    );
     assert_eq!(
         fields["base_url"]["depends"],
         json!({"integration.isnull":false})
@@ -339,7 +346,7 @@ async fn token_providers_connect_by_checking_the_token_and_syncs_keep_outside_id
     let provider = listed["providers"][0].clone();
     assert_eq!(provider["kind"], "token");
     assert_eq!(provider["status"], "needs_credentials");
-    assert_eq!(provider["token"], "");
+    assert_eq!(provider["token"], Value::Null, "nothing saved yet");
     assert_eq!(provider["default_base_url"], base);
     assert!(provider["redirect_uri"].is_null());
     let detail = format!("/api/admin/providers/{}/", provider["id"].as_str().unwrap());
@@ -524,7 +531,7 @@ async fn token_providers_connect_by_checking_the_token_and_syncs_keep_outside_id
     assert_eq!(status, 200, "{disconnected}");
     let (_, shown) = request(&app, "GET", &detail, owner, Value::Null).await;
     assert_eq!(shown["provider"]["status"], "needs_credentials");
-    assert_eq!(shown["provider"]["token"], "");
+    assert_eq!(shown["provider"]["token"], Value::Null);
     let secret: Option<String> = sqlx::query_scalar(
         "SELECT client_secret FROM app_integration_secrets WHERE provider='ledger'",
     )

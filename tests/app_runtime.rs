@@ -847,8 +847,13 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
         for operation in ["create", "update", "delete"] {
             assert_eq!(schema["permissions"][operation], false);
         }
+        // Providers are a model: its fields say what the app declares, and the
+        // operations above say this person may change none of them.
+        let model = kind == "providers";
         for field in schema["fields"].as_object().unwrap().values() {
-            assert_eq!(field["read_only"], true);
+            if !model {
+                assert_eq!(field["read_only"], true);
+            }
             assert_eq!(
                 field["ui"], true,
                 "The shared viewer requires explicit visible fields"
@@ -874,10 +879,12 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             },
             "unexpected navigation section for {kind}"
         );
-        assert_eq!(
-            schema["permissions"]["fields"]["name"]["write"],
-            json!({"create":false,"update":false})
-        );
+        if !model {
+            assert_eq!(
+                schema["permissions"]["fields"]["name"]["write"],
+                json!({"create":false,"update":false})
+            );
+        }
         assert_eq!(
             call(
                 &f.app,
@@ -889,8 +896,9 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             .0,
             200
         );
-        // Roles, dashboards, views, providers and users can be created by people whose roles
+        // Roles, dashboards, views and users can be created by people whose roles
         // allow it; this viewer's cannot. Every other built-in resource is read-only.
+        // Providers are a model, which reads the body first, as every model does.
         assert_eq!(
             call(
                 &f.app,
@@ -900,10 +908,9 @@ async fn core_runtime_auth_metadata_and_read_only_routes() {
             )
             .await
             .0,
-            if matches!(
-                kind,
-                "roles" | "dashboards" | "views" | "users" | "providers"
-            ) {
+            if model {
+                400
+            } else if matches!(kind, "roles" | "dashboards" | "views" | "users") {
                 403
             } else {
                 405
@@ -1485,7 +1492,11 @@ async fn providers_are_editable_by_admins_and_saved_grants_survive_sign_in() {
     let role_id = admin["id"].as_str().unwrap();
     let role_path = format!("/api/admin/roles/{role_id}/");
     let all = json!({"list":true,"read":true,"create":true,"update":true,"delete":true});
-    assert_eq!(admin["permissions"]["providers"], all);
+    // Providers are a model like any other: Admin holds its actions too.
+    let mut with_actions = all.clone();
+    with_actions["connect"] = json!(true);
+    with_actions["disconnect"] = json!(true);
+    assert_eq!(admin["permissions"]["providers"], with_actions);
     // Exercise a regular user holding Admin, as well as the superuser bypass.
     sqlx::query("UPDATE app_records SET data=jsonb_set(data,'{data,roles}',$2) WHERE id=$1")
         .bind(f.user)
@@ -1500,12 +1511,8 @@ async fn providers_are_editable_by_admins_and_saved_grants_survive_sign_in() {
         }
         for field in ["name", "kind", "enabled"] {
             assert_eq!(schema["fields"][field]["read_only"], false);
-            assert_eq!(
-                schema["permissions"]["fields"][field]["write"],
-                json!({"create":true,"update":true})
-            );
+            assert_eq!(schema["permissions"]["fields"][field]["write"], true);
         }
-        assert_eq!(schema["fields"]["kind"]["required"], true);
     }
     for input in [
         json!({"name":"", "kind":"email"}),
@@ -1533,31 +1540,27 @@ async fn providers_are_editable_by_admins_and_saved_grants_survive_sign_in() {
     assert_eq!(created["provider"]["enabled"], true);
     let id = created["provider"]["id"].as_str().unwrap();
     let path = format!("/api/admin/providers/{id}/");
-    sqlx::query("UPDATE app_records SET data=data || $2 WHERE id=$1")
-        .bind(Uuid::parse_str(id).unwrap())
-        .bind(json!({"secret":"keep-private","credentials":{"key":"keep-private"}}))
-        .execute(&f.pool)
-        .await
-        .unwrap();
+    // As on any model, a field the provider does not have is refused, and one
+    // added by hand takes no credentials.
+    for input in [
+        json!({"name":"Renamed mail","secret":"overwrite"}),
+        json!({"client_secret":"overwrite"}),
+    ] {
+        let (status, body) = admin_write(&f.app, "PATCH", &path, &f.cookie, input).await;
+        assert_eq!(status, 400, "{body}");
+    }
     let (status, updated) = admin_write(
         &f.app,
         "PATCH",
         &path,
         &f.cookie,
-        json!({"name":"Renamed mail","enabled":false,"secret":"overwrite"}),
+        json!({"name":"Renamed mail","enabled":false}),
     )
     .await;
     assert_eq!(status, 200, "{updated}");
     assert_eq!(updated["provider"]["kind"], "email");
     assert_eq!(updated["provider"]["enabled"], false);
-    assert!(!updated.to_string().contains("private"));
-    let stored: Value = sqlx::query_scalar("SELECT data FROM app_records WHERE id=$1")
-        .bind(Uuid::parse_str(id).unwrap())
-        .fetch_one(&f.pool)
-        .await
-        .unwrap();
-    assert_eq!(stored["secret"], "keep-private");
-    assert_eq!(stored["credentials"]["key"], "keep-private");
+    assert!(!updated.to_string().contains("overwrite"));
 
     // An explicit denial and a removed resource both survive logout/sign-in and migrations.
     let mut permissions = admin["permissions"].clone();

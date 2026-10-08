@@ -30,14 +30,15 @@ mod preview;
 pub use google_auth::GoogleAuth;
 pub use magic_auth::LOGIN_VISUALS;
 
-const KINDS: [&str; 7] = [
+/// The built-in resources the runtime manages itself. Providers are a
+/// built-in model instead (see [`integrations`]), served like the app's own.
+const KINDS: [&str; 6] = [
     "users",
     "identities",
     "identity_verifications",
     "roles",
     "dashboards",
     "views",
-    "providers",
 ];
 const DOCUMENT: &str = "data || jsonb_build_object('id',id,'created',created,'updated',updated)";
 #[derive(Clone)]
@@ -91,6 +92,10 @@ impl App {
             // resource or action one names: only that entry grants nothing.
             let access = crate::parse_stored_access_map(&permissions, &targets, &actions);
             actor.hold(&name, access);
+            actor.hold_fields(
+                &name,
+                crate::parse_stored_field_access(&permissions, &targets),
+            );
         }
         actor.admit();
         Ok(actor)
@@ -223,23 +228,6 @@ fn fields(kind: &str) -> Vec<(&str, &str)> {
             ("method", "string"),
         ],
         "roles" => vec![("name", "string"), ("permissions", "permissions")],
-        "providers" => vec![
-            ("name", "string"),
-            ("kind", "string"),
-            ("enabled", "boolean"),
-            ("integration", "string"),
-            ("description", "string"),
-            ("status", "string"),
-            ("account", "json"),
-            ("connected_at", "datetime"),
-            ("error", "string"),
-            ("client_id", "string"),
-            ("client_secret", "string"),
-            ("redirect_uri", "string"),
-            ("token", "string"),
-            ("base_url", "string"),
-            ("default_base_url", "string"),
-        ],
         "views" => vec![("name", "string"), ("resource", "string"), ("data", "json")],
         _ => vec![("name", "string"), ("data", "json")],
     });
@@ -266,10 +254,6 @@ fn writable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
         ("dashboards", "name" | "data") | ("views", "name" | "resource" | "data") => {
             actor.granted(kind, "update")
         }
-        (
-            "providers",
-            "name" | "kind" | "enabled" | "client_id" | "client_secret" | "token" | "base_url",
-        ) => actor.granted("providers", "update"),
         _ => false,
     }
 }
@@ -278,7 +262,6 @@ fn writable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
 fn creatable(kind: &str, field: &str, actor: &extensions::Actor) -> bool {
     match (kind, field) {
         ("users", "name" | "email" | "roles") => actor.granted("users", "create"),
-        ("providers", "name" | "kind" | "enabled") => actor.granted("providers", "create"),
         ("roles", "name" | "permissions") => actor.granted("roles", "create"),
         ("dashboards", "name" | "data") | ("views", "name" | "resource" | "data") => {
             actor.granted(kind, "create")
@@ -291,7 +274,7 @@ pub(crate) fn core_supports(kind: &str, operation: &str) -> bool {
     matches!(
         (kind, operation),
         (
-            "roles" | "dashboards" | "views" | "users" | "providers",
+            "roles" | "dashboards" | "views" | "users",
             "create" | "update" | "delete"
         )
     )
@@ -323,7 +306,7 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
         let write=writable(kind,name,actor);
         let create=creatable(kind,name,actor);
         let editable=write||create;
-        let required=editable && (name=="name" || (kind=="users" && name=="email") || (kind=="providers" && name=="kind"));
+        let required=editable && (name=="name" || (kind=="users" && name=="email"));
         let mut field=json!({"name":name,"label":crate::python_title(&name.replace('_'," ")),"type":typ,"read_only":!editable,"required":required,"nullable":!editable,"null":!editable,"many":typ=="relation","ui":true,"hidden":false,"deferred":false,"sortable":filterable(kind,name),"filterable":filterable(kind,name)});
         match (kind,name) {
             ("users","roles")=>{
@@ -334,33 +317,6 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
             ("roles","permissions")=>{
                 field["description"]=json!("What this role may do, per resource and operation. A rule is allowed, denied, or a condition the records must meet.");
                 field["resources"]=access_resources(app);
-            }
-            ("providers",_)=>{
-                let description=match name {
-                    "integration"=>"The service in the app's code this provider connects, if any.",
-                    "status"=>"For an integration: needs_credentials until its client ID and secret, or its token, are saved; then disconnected until someone presses Connect; connected; or error when access was refused or lost.",
-                    "account"=>"The account this app is connected to, as the service identified it.",
-                    "error"=>"Why the last attempt to connect or refresh access failed.",
-                    "client_id"=>"The OAuth client ID from the service's developer console.",
-                    "client_secret"=>"The OAuth client secret. It is kept privately and never shown again; enter a new one to replace it.",
-                    "redirect_uri"=>"Register this exact URL as a redirect URI in the service's developer console.",
-                    "token"=>"The API token (key) the service issued for this app. It is kept privately and never shown again; enter a new one to replace it.",
-                    "base_url"=>"Where the service's API is, when not the default: another tenant, a sandbox or a test server.",
-                    "default_base_url"=>"The service's API location for this environment, used when Base URL is blank.",
-                    "enabled"=>"Turn off to stop the app from using this service without disconnecting it.",
-                    _=>"",
-                };
-                if !description.is_empty() { field["description"]=json!(description); }
-                if name=="client_secret" || name=="token" { field["secret"]=json!(true); }
-                if ["client_id","client_secret","token","base_url"].contains(&name) { field["required"]=json!(false); field["nullable"]=json!(true); field["null"]=json!(true); }
-                // Each kind of integration shows only its own fields.
-                match name {
-                    "client_id"|"client_secret"|"redirect_uri"=>field["depends"]=json!({"kind":"oauth2"}),
-                    "token"=>field["depends"]=json!({"kind":"token"}),
-                    "base_url"|"default_base_url"=>field["depends"]=json!({"integration.isnull":false}),
-                    _=>{}
-                }
-                if name=="default_base_url" { field["hide"]=json!(true); }
             }
             _=>{}
         }
@@ -389,26 +345,11 @@ fn schema(app: &App, kind: &str, actor: &extensions::Actor, roles: &[Value]) -> 
             )
         })
         .collect();
-    let mut value = json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":crate::python_title(&kind.replace('_'," ")),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":section(kind),"fields":fields,"permissions":{"list":readable,"read":readable,"create":operations["create"],"update":operations["update"],"delete":operations["delete"],"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]});
-    if kind == "providers" {
-        value["list_fields"] = json!(["name", "kind", "status", "enabled"]);
-        value["actions"] = if actor.granted("providers", "update") {
-            integrations::actions()
-        } else {
-            json!([])
-        };
-    }
+    let value = json!({"type":"resource","name":kind,"singular":singular(kind),"singular_name":singular(kind),"label":crate::python_title(&kind.replace('_'," ")),"icon":icon,"url":format!("/api/admin/{kind}/"),"id_field":"id","name_field":"name","section":section(kind),"fields":fields,"permissions":{"list":readable,"read":readable,"create":operations["create"],"update":operations["update"],"delete":operations["delete"],"fields":permissions},"features":{"detail":true},"sections":[{"name":"details","label":"Details","fields":field_names}],"list_fields":["name","created"]});
     value
 }
 /// Built-in fields the list endpoint can filter and sort by.
 fn filterable(kind: &str, field: &str) -> bool {
-    // A provider's secrets, redirect URI and default base URL are not stored
-    // on the record.
-    if kind == "providers"
-        && ["client_secret", "redirect_uri", "token", "default_base_url"].contains(&field)
-    {
-        return false;
-    }
     !fields(kind).iter().any(|(name, typ)| {
         *name == field && ["json", "list", "permissions", "image upload"].contains(typ)
     })
@@ -444,6 +385,23 @@ fn access_resources(app: &App) -> Value {
                 str::to_owned,
             );
         let mut entry = json!({"label":label,"conditional":true,"open":open});
+        // The fields a role may reveal or open for changes, with what the app declares.
+        entry["fields"] = model
+            .resource
+            .fields
+            .iter()
+            .map(|field| {
+                let label = field
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| crate::python_title(&field.name.replace('_', " ")));
+                (
+                    field.name.clone(),
+                    json!({"label":label,"read_only":field.read_only,"write_only":field.write_only}),
+                )
+            })
+            .collect::<Map<String, Value>>()
+            .into();
         if let Some(names) = actions.get(name) {
             entry["actions"] = json!(names
                 .iter()
@@ -631,16 +589,7 @@ async fn list(
         .fetch_all(&app.pool)
         .await
         .map_err(ApiError::internal)?;
-    let saved = if kind == "providers" {
-        integrations::secrets_saved(&app.pool).await?
-    } else {
-        vec![]
-    };
     for record in &mut records {
-        if kind == "providers" {
-            let secret = integrations::secret_saved(&saved, record);
-            integrations::present(&app, record, secret);
-        }
         *record = project_record(&kind, record.take(), &features);
     }
     Ok(Json(ApiDocument::many(
@@ -671,7 +620,7 @@ async fn retrieve(
     if !own && !app.actor(&person).await?.core_readable(&kind) {
         return Err(ApiError::Forbidden);
     }
-    let mut record: Value = sqlx::query_scalar(&format!(
+    let record: Value = sqlx::query_scalar(&format!(
         "SELECT {DOCUMENT} FROM app_records WHERE kind=$1 AND id=$2"
     ))
     .bind(&kind)
@@ -680,11 +629,6 @@ async fn retrieve(
     .await
     .map_err(ApiError::internal)?
     .ok_or(ApiError::NotFound)?;
-    if kind == "providers" {
-        let saved = integrations::secrets_saved(&app.pool).await?;
-        let secret = integrations::secret_saved(&saved, &record);
-        integrations::present(&app, &mut record, secret);
-    }
     let features = QueryFeatures::parse(raw.as_deref().unwrap_or(""), 10000)?;
     Ok(Json(ApiDocument::one(
         singular(&kind),
@@ -781,13 +725,8 @@ async fn core_write(
     let actor = app.actor(&user(app, headers).await?).await?;
     let mut tx = app.pool.begin().await.map_err(ApiError::internal)?;
     extensions::lock(&mut tx).await?;
-    let mut record = core::write(app, &mut tx, &actor, kind, id, input, method).await?;
+    let record = core::write(app, &mut tx, &actor, kind, id, input, method).await?;
     tx.commit().await.map_err(ApiError::internal)?;
-    if kind == "providers" && record.is_object() {
-        let saved = integrations::secrets_saved(&app.pool).await?;
-        let secret = integrations::secret_saved(&saved, &record);
-        integrations::present(app, &mut record, secret);
-    }
     Ok(record)
 }
 /// Built-in resources answer 405 before any body is read, so an unsupported

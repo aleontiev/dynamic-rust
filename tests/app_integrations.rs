@@ -71,7 +71,7 @@ impl Handler for FetchCompany {
         let url = format!(
             "{}/v3/company/{}",
             input["data"]["base"].as_str().unwrap(),
-            books.account["realmId"].as_str().unwrap()
+            books.account["companyId"].as_str().unwrap()
         );
         let company: Value = books
             .get(&url)
@@ -188,7 +188,7 @@ fn registry(service: &str) -> Registry {
                 .token_url(&format!("{service}/token"))
                 .scopes(&["accounting", "openid"])
                 .authorize_param("prompt", "consent")
-                .account_params(&["realmId"]),
+                .account_params(&["companyId"]),
         )
         .unwrap();
     registry
@@ -585,9 +585,10 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
         .clone();
     assert_eq!(admin_role["permissions"]["orders"]["approve"], true);
     assert_eq!(admin_role["permissions"]["orders"]["reject"], true);
+    // Providers are a model like any other: the Admin role holds its actions too.
     assert_eq!(
         admin_role["permissions"]["providers"],
-        json!({"list":true,"read":true,"create":true,"update":true,"delete":true})
+        json!({"list":true,"read":true,"create":true,"update":true,"delete":true,"connect":true,"disconnect":true})
     );
     // Maps may name only registered actions of that resource.
     for permissions in [
@@ -729,7 +730,8 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     assert_eq!(provider["kind"], "oauth2");
     assert_eq!(provider["status"], "needs_credentials");
     assert_eq!(provider["enabled"], true);
-    assert_eq!(provider["client_secret"], "");
+    assert_eq!(provider["client_secret"], Value::Null, "nothing saved yet");
+    assert_eq!(provider["primary"], true);
     assert_eq!(
         provider["redirect_uri"],
         "https://example.com/api/integrations/books/callback"
@@ -767,7 +769,7 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
         ),
         (
             "Integrator",
-            json!({"providers":{"list":true,"read":true,"update":true}}),
+            json!({"providers":{"list":true,"read":true,"update":true,"connect":true,"disconnect":true}}),
             "integrator",
         ),
     ] {
@@ -802,7 +804,6 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     .await;
     assert_eq!(meta["actions"], json!([]));
     assert_eq!(meta["permissions"]["update"], false);
-    assert_eq!(meta["fields"]["client_id"]["read_only"], true);
     assert_eq!(
         request(&app, "PATCH", &detail, &auditor, json!({"client_id":"x"}))
             .await
@@ -826,7 +827,13 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     assert_eq!(meta["fields"]["client_secret"]["read_only"], false);
     assert_eq!(meta["fields"]["status"]["read_only"], true);
     assert_eq!(meta["fields"]["redirect_uri"]["read_only"], true);
-    assert_eq!(meta["fields"]["integration"]["read_only"], true);
+    assert_eq!(
+        meta["permissions"]["fields"]["integration"]["write"],
+        json!({"update":false,"create":true}),
+        "the service is chosen when a connection is added, then fixed"
+    );
+    assert_eq!(meta["fields"]["client_secret"]["secret"], true);
+    assert_eq!(meta["fields"]["token"]["depends"], json!({"kind":"token"}));
     let names: Vec<_> = meta["actions"]
         .as_array()
         .unwrap()
@@ -910,21 +917,28 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     // --- Connecting -------------------------------------------------------------
     let (status, _, body) = send(&app, "POST", &connect, &integrator, None).await;
     assert_eq!(status, 409, "credentials come first: {body}");
+    // What the service owns is read-only, as on any model.
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        &detail,
+        &integrator,
+        json!({"client_id":"client-123","status":"connected"}),
+    )
+    .await;
+    assert_eq!(status, 400, "status is not writable: {body}");
     let (status, saved) = request(
         &app,
         "PATCH",
         &detail,
         &integrator,
-        json!({"client_id":" client-123 ","client_secret":"secret-xyz","status":"connected"}),
+        json!({"client_id":" client-123 ","client_secret":"secret-xyz"}),
     )
     .await;
     assert_eq!(status, 200, "{saved}");
     assert_eq!(saved["provider"]["client_id"], "client-123");
     assert_eq!(saved["provider"]["client_secret"], "Saved");
-    assert_eq!(
-        saved["provider"]["status"], "disconnected",
-        "status is not writable"
-    );
+    assert_eq!(saved["provider"]["status"], "disconnected");
     let stored: String =
         sqlx::query_scalar("SELECT data::text FROM app_records WHERE kind='providers'")
             .fetch_one(&pool)
@@ -985,7 +999,9 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     let (status, headers, _) = send(
         &app,
         "GET",
-        &callback(&format!("state={state_token}&code=good-code&realmId=9130")),
+        &callback(&format!(
+            "state={state_token}&code=good-code&companyId=9130"
+        )),
         "",
         None,
     )
@@ -1008,7 +1024,7 @@ async fn actions_integrations_and_outside_calls_follow_roles() {
     let (_, record) = request(&app, "GET", &detail, &auditor, Value::Null).await;
     let record = &record["provider"];
     assert_eq!(record["status"], "connected");
-    assert_eq!(record["account"], json!({"realmId":"9130"}));
+    assert_eq!(record["account"], json!({"companyId":"9130"}));
     assert!(record["connected_at"].is_string());
     assert!(record["error"].is_null());
     assert!(
