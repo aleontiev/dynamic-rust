@@ -380,6 +380,14 @@ impl Model {
             )
             .unique(&["external_id"])
     }
+    /// A field holding one file (a receipt, a contract, a photo): people
+    /// upload it through `POST /api/admin/files/` and set the field to the
+    /// upload, and reading the record gives its name, size, type and a `url`
+    /// to fetch it. Files go to the app's bucket when it has one, else to
+    /// `PostgreSQL`; see [`super::files`].
+    pub fn file(self, name: &str) -> Self {
+        self.field(name, FieldKind::File)
+    }
     pub fn hook(mut self, hook: impl Hook + 'static) -> Self {
         self.hook = Some(Arc::new(hook));
         self
@@ -528,6 +536,10 @@ impl Default for Registry {
             integrations: BTreeMap::new(),
         };
         super::integrations::register(&mut registry);
+        registry.tasks.insert(
+            super::files::DELETE_TASK.into(),
+            Arc::new(super::files::DeleteFile),
+        );
         registry
     }
 }
@@ -639,6 +651,7 @@ impl Registry {
         let name = &model.resource.plural_name;
         if !identifier(name)
             || super::KINDS.contains(&name.as_str())
+            || name == "files"
             || self.models.contains_key(name)
         {
             return Err(ApiError::Parse(format!(
@@ -965,7 +978,7 @@ pub struct Context<'a> {
     /// integration's tokens.
     pool: Option<PgPool>,
     /// Writes with the application's own authority ([`Context::elevated`]).
-    elevated: bool,
+    pub(super) elevated: bool,
 }
 impl<'a> Context<'a> {
     /// A context over a transaction that already holds the application write
@@ -1084,6 +1097,20 @@ impl<'a> Context<'a> {
     /// record that does not exist; returns database errors.
     pub async fn add_connection(&mut self, name: &str, record: Uuid) -> Result<Uuid, ApiError> {
         super::integrations::ensure(self, name, record).await
+    }
+    /// Store a file this code made (a PDF, an export) and return the value to
+    /// set on a [`Model::file`] field with an elevated write:
+    /// `ctx.elevated().update("orders", id, json!({"pdf": file}))`.
+    ///
+    /// # Errors
+    /// The file store refused or could not be reached.
+    pub async fn put_file(
+        &mut self,
+        name: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<Value, ApiError> {
+        super::files::put(self, name, content_type, bytes).await
     }
     /// Bring in one record from an outside service: update the `kind` record
     /// whose `external_id` is `external_id` with `input`, or create it, as the
@@ -1318,6 +1345,8 @@ impl<'a> Context<'a> {
             let result=async {
                 if let Some(hook)=&model.hook { hook.before(self,operation,previous.as_ref(),&mut record).await?; }
                 if record["id"]!=json!(id) { return Err(ApiError::Parse("Hooks cannot change record identity".into())); }
+                // Files: uploads become kept files; ones let go of are removed after commit.
+                let released=super::files::resolve_all(self,&model.resource,operation,id,previous.as_ref(),&mut record).await?;
                 if operation=="delete" {
                     for related in self.registry.models.values() {
                         for field in &related.resource.fields {
@@ -1338,6 +1367,7 @@ impl<'a> Context<'a> {
                     for reserved in ["id","created","updated"] { data.as_object_mut().unwrap().remove(reserved); }
                     record=sqlx::query_scalar(&format!("INSERT INTO app_records(id,kind,data) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,updated=now() RETURNING {DOCUMENT}")).bind(id).bind(kind).bind(data).fetch_one(&mut *self.connection).await.map_err(ApiError::internal)?;
                 }
+                for file in &released { super::files::release(self,file).await?; }
                 if let Some(hook)=&model.hook { hook.after(self,operation,previous.as_ref(),&record).await?; }
                 Ok(output(&resource,record))
             }.await;
@@ -1372,8 +1402,14 @@ impl<'a> Context<'a> {
 /// A record as people see it: every readable field, `null` where it holds no
 /// value, so clients can tell an empty field from one they have not loaded.
 pub(super) fn output(resource: &Resource, mut value: Value) -> Value {
+    let id = value["id"].as_str().unwrap_or_default().to_owned();
     let object = value.as_object_mut().unwrap();
     object.retain(|name, _| resource.field(name).is_some_and(|f| !f.write_only));
+    for field in resource.fields.iter().filter(|f| f.kind == FieldKind::File) {
+        if let Some(file) = object.get_mut(&field.name) {
+            *file = super::files::public(&resource.plural_name, &id, &field.name, file);
+        }
+    }
     for field in &resource.fields {
         if !field.write_only && !field.deferred && !object.contains_key(&field.name) {
             object.insert(field.name.clone(), Value::Null);
@@ -1455,6 +1491,8 @@ async fn validate_record(
                 value.as_str().is_some_and(|s| Uuid::parse_str(s).is_ok())
             }
             FieldKind::Json => true,
+            // A kept file, as the write resolved it.
+            FieldKind::File => value.get("store").is_some_and(Value::is_string),
             _ => value.is_string(),
         };
         if !valid {

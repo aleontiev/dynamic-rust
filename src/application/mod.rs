@@ -16,6 +16,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
 mod extension_api;
 pub mod extensions;
+pub mod files;
 pub mod integrations;
 pub mod task_runner;
 /// The HTTP client library behind [`extensions::Context::http`] and
@@ -800,6 +801,9 @@ pub fn router(app: App) -> Router {
         .route("/auth/google/callback",get(google_auth::callback))
         .route("/integrations/{name}/callback",get(integrations::callback))
         .route("/admin/",get(metadata).options(metadata)).route("/admin/users/me/",get(me))
+        .route("/admin/files/",axum::routing::post(files::begin))
+        .route("/admin/files/{id}/",axum::routing::put(files::receive))
+        .route("/admin/{kind}/{id}/files/{field}/",get(files::download))
         .route("/admin/{kind}/",get(list).options(options).post(create))
         .route("/admin/{kind}/{id}/",get(retrieve).patch(update).put(replace).delete(delete))
         .route("/admin/{kind}/{id}/actions/{action}/",axum::routing::post(extension_api::action))

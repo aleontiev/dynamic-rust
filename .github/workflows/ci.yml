@@ -12,8 +12,20 @@ jobs:
         options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       DREAM_TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/dynamic_tests
+      # File fields with a bucket run against SeaweedFS's S3 API, standing in
+      # for S3 and R2 in tests only.
+      DREAM_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+      DREAM_TEST_S3_BUCKET: app-files
+      DREAM_TEST_S3_ACCESS_KEY: test-access
+      DREAM_TEST_S3_SECRET_KEY: test-secret-key
     steps:
       - uses: actions/checkout@v4
+      - name: Start an S3-compatible bucket
+        run: |
+          echo '{"identities":[{"name":"test","credentials":[{"accessKey":"test-access","secretKey":"test-secret-key"}],"actions":["Admin","Read","Write","List"]}]}' > "$RUNNER_TEMP/s3.json"
+          docker run -d --name s3 -p 8333:8333 -v "$RUNNER_TEMP/s3.json:/etc/s3.json:ro" chrislusf/seaweedfs:4.48 server -s3 -s3.config=/etc/s3.json -dir=/data
+          for i in $(seq 1 30); do docker exec s3 sh -c 'echo "s3.bucket.create -name app-files" | weed shell -master=localhost:9333' 2>/dev/null | grep -q "created bucket" && break; sleep 2; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/app-files/)" = 403
       - run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
       - run: rustup default 1.88.0
       - run: cargo fmt --check

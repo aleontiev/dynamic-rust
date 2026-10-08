@@ -58,3 +58,19 @@ CREATE TABLE IF NOT EXISTS app_integration_states (
     expires timestamptz NOT NULL
 );
 CREATE INDEX IF NOT EXISTS app_integration_states_expires ON app_integration_states(expires);
+CREATE TABLE IF NOT EXISTS app_uploads (
+    id uuid PRIMARY KEY,
+    kind text NOT NULL,
+    field text NOT NULL,
+    user_id uuid,
+    name text NOT NULL,
+    size bigint NOT NULL,
+    content_type text NOT NULL,
+    store text NOT NULL,
+    key text,
+    oid oid,
+    state text NOT NULL DEFAULT 'pending',
+    expires timestamptz NOT NULL,
+    created timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS app_uploads_expires ON app_uploads(expires);

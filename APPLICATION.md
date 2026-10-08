@@ -309,6 +309,63 @@ what the task read, or before writing with raw SQL. Keep outside calls out of
 hooks and actions — they run inside a user's request, which must finish within
 the host's timeout — and queue a task for them instead.
 
+## Files
+
+Declare a field holding one file — a receipt scan, a signed contract, a photo —
+with `.file("scan")`. Never keep file contents in a record (no base64 text
+fields): a file field keeps the bytes out of the database row and serves them
+without loading them into the app.
+
+People attach a file in two steps:
+
+1. `POST /api/admin/files/` with `{"model": "receipts", "field": "scan",
+   "name": "May fuel.pdf", "size": 48213, "content_type": "application/pdf"}`
+   answers `201 {"upload": {"id", "method": "PUT", "url", "headers",
+   "expires_in"}}`. Only someone who may create or update the model, and may
+   write the field, can start one.
+2. `PUT` the bytes to `url` with `headers`, then write the record with the
+   field set to `{"upload": "<id>"}` (on create or PATCH). The upload must be
+   theirs, for that model and field, unexpired, and exactly `size` bytes; it
+   can be attached once.
+
+Reading the record gives the field as `{"name", "size", "content_type",
+"uploaded", "url"}`; `GET url` (`/api/admin/<model>/<id>/files/<field>/`) gives
+the file to whoever may read the record and see the field. Sending back the
+value read keeps the file, `null` removes it, and another upload replaces it;
+a replaced or removed file, and every file of a deleted record, is deleted
+once the write commits. People cannot point a field at a stored file
+themselves.
+
+Where files go depends on the host:
+
+- With `APP_STORAGE_BUCKET` set, files are objects in that S3-protocol bucket
+  (Amazon S3, Cloudflare R2, Google Cloud Storage's interoperability API),
+  under `APP_STORAGE_PREFIX` (`apps/<project>/<stage>/`). The browser uploads
+  straight to the bucket through a signed `PUT` and downloads through a
+  short-lived signed link the app redirects to, so file bytes never pass
+  through the app. `APP_STORAGE_REGION` and `APP_STORAGE_ENDPOINT` (an R2 or
+  GCS endpoint; S3's regional endpoint by default) say where it is,
+  `APP_STORAGE_PATH_STYLE=true` addresses it as `endpoint/bucket/key`, and
+  `APP_STORAGE_ACCESS_KEY_ID`/`APP_STORAGE_SECRET_ACCESS_KEY` sign requests,
+  else the host's `AWS_*` credentials (an IAM role). The bucket needs a CORS
+  rule letting the app's origin `PUT` and `GET`.
+- Without one, files are `PostgreSQL` large objects in the app's own database:
+  the bytes are `PUT` to the app itself.
+
+Uploads may be up to `APP_STORAGE_MAX_BYTES` (100 MiB to a bucket, 10 MiB to
+`PostgreSQL` by default) and expire after an hour if never attached.
+
+Code stores files it makes — an export, a generated PDF — with
+`ctx.put_file("export.csv", "text/csv", bytes).await?` and sets the returned
+value on a file field with an elevated write:
+
+```rust
+let file = ctx.put_file("po-1042.pdf", "application/pdf", pdf).await?;
+ctx.elevated().update("purchase_orders", id, json!({"pdf": file})).await?;
+```
+
+Mark such fields `.readonly(...)` when people should only read them.
+
 ## Calling outside services
 
 `dynamic_rust::application::reqwest` is the HTTP client library, and
